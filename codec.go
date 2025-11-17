@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
 	"io"
 	"sort"
 

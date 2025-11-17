@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	_ "image/jpeg"
+	_ "image/gif"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,7 +15,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintf(os.Stderr, "Usage:\n  %s <input-image> [quality 0–29]\n  %s <input.babe>\n", os.Args[0], os.Args[0])
+		fmt.Fprint(os.Stderr, "Encode: babe <input-image> [quality 0–29]\nDecode: babe <input.babe>\n")
 		os.Exit(1)
 	}
 
