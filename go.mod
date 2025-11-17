@@ -1,4 +1,4 @@
-module main
+module github.com/svanichkin/Babe
 
 go 1.25.1
 
