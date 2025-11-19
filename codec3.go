@@ -75,8 +75,14 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 
 	// Преобразуем refs в плоский массив локальных индексов (по порядку листьев).
 	leafLocal := make([]uint8, len(refs))
+	leafCounts := make([]uint16, len(pals))
 	for i, r := range refs {
 		leafLocal[i] = r.idx
+		pid := int(r.pal)
+		if pid < 0 || pid >= len(pals) {
+			return nil, fmt.Errorf("encode: invalid palette id %d in refs", pid)
+		}
+		leafCounts[pid]++
 	}
 
 	// 3) Собираем сырой битстрим.
@@ -84,15 +90,21 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 
 	// Сначала пишем все палитры:
 	// uint16 numPalettes, затем для каждой:
-	// uint8 palSize, затем palSize * RGB.
+	// uint16 leafCount, uint16 palSize, затем palSize * RGB.
 	if err := binary.Write(&raw, binary.BigEndian, uint16(len(pals))); err != nil {
 		return nil, err
 	}
-	for _, p := range pals {
-		if len(p.colors) > 255 {
-			return nil, fmt.Errorf("_encode: palette size %d exceeds 255", len(p.colors))
+	for i, p := range pals {
+		// Базовый инвариант: одна палитра содержит не более 256 уникальных цветов.
+		if len(p.colors) > 256 {
+			return nil, fmt.Errorf("_encode: palette size %d exceeds 256", len(p.colors))
 		}
-		if err := raw.WriteByte(byte(len(p.colors))); err != nil {
+		// количество листьев, использующих эту палитру
+		if err := binary.Write(&raw, binary.BigEndian, leafCounts[i]); err != nil {
+			return nil, err
+		}
+		// размер палитры (uint16, чтобы вместить 256)
+		if err := binary.Write(&raw, binary.BigEndian, uint16(len(p.colors))); err != nil {
 			return nil, err
 		}
 		for _, c := range p.colors {
@@ -199,12 +211,16 @@ func Decode(data []byte) (image.Image, error) {
 		return nil, err
 	}
 	palettes := make([][]color.RGBA, numPalettes)
+	leafCounts := make([]uint16, numPalettes)
 	for i := 0; i < int(numPalettes); i++ {
-		szByte, err := reader.ReadByte()
-		if err != nil {
+		if err := binary.Read(reader, binary.BigEndian, &leafCounts[i]); err != nil {
 			return nil, err
 		}
-		sz := int(szByte)
+		var sz16 uint16
+		if err := binary.Read(reader, binary.BigEndian, &sz16); err != nil {
+			return nil, err
+		}
+		sz := int(sz16)
 		if sz < 0 {
 			return nil, fmt.Errorf("codec2: negative palette size")
 		}
@@ -230,9 +246,11 @@ func Decode(data []byte) (image.Image, error) {
 	// и собираем список листьев.
 	var jobs []leafJob
 	stripes := splitStripes(h, params.minBlock)
-	leafCounter := 0
+	// Текущая палитра и количество уже использованных листьев в ней.
+	curPal := 0
+	usedInPal := 0
 	for _, s := range stripes {
-		if err := decodeRegionJobs(0, s.y, w, s.h, params, br, palettes, &leafCounter, &jobs); err != nil {
+		if err := decodeRegionJobs(0, s.y, w, s.h, params, br, palettes, leafCounts, &curPal, &usedInPal, &jobs); err != nil {
 			return nil, err
 		}
 	}
@@ -341,7 +359,7 @@ func paramsForQuality(q int) codec2Params {
 	params := codec2Params{
 		minBlock: 1,
 		maxGrad:  1 + int32(qi),
-		colorTol: 1 + int(float64(qi)*(12.0/100.0)),
+		colorTol: 1 + int(float64(qi)*(10.0/100.0)),
 	}
 	fmt.Printf("minBlock=%d, maxGrad=%d, colorTol=%d\n",
 		params.minBlock,
@@ -628,12 +646,6 @@ func buildPalettes(leaves []leafColor, params codec2Params) ([]palette, []leafRe
 	curPalID := 0
 
 	for i, lf := range leaves {
-		// Каждые 256 листьев — новая палитра.
-		if i > 0 && (i%256) == 0 {
-			pals = append(pals, palette{colors: make([]color.RGBA, 0, 256)})
-			curPalID++
-		}
-
 		p := &pals[curPalID]
 
 		// Пытаемся найти "близкий" цвет в текущей палитре.
@@ -645,10 +657,12 @@ func buildPalettes(leaves []leafColor, params codec2Params) ([]palette, []leafRe
 			}
 		}
 		if found < 0 {
-			// Новый цвет. Теоретически размер палитры не должен превышать 256,
-			// потому что у нас максимум 256 листьев на одну палитру.
+			// Новый цвет. Если текущая палитра уже содержит 256 уникальных цветов,
+			// заводим новую палитру и переключаемся на неё.
 			if len(p.colors) >= 256 {
-				return nil, nil, fmt.Errorf("buildPalettes: palette %d exceeded 256 colors", curPalID)
+				pals = append(pals, palette{colors: make([]color.RGBA, 0, 256)})
+				curPalID++
+				p = &pals[curPalID]
 			}
 			p.colors = append(p.colors, lf.c)
 			found = len(p.colors) - 1
@@ -742,21 +756,28 @@ func encodeLeaf(bw *BitWriter, local uint8) error {
 // decodeRegionJobs зеркален decodeRegion, но вместо отрисовки листьев
 // собирает список "работ" по заливке блоков цветом. Это позволяет
 // считать битстрим последовательно, а рисовать блоки — параллельно.
-func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palettes [][]color.RGBA, leafCounter *int, jobs *[]leafJob) error {
+func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palettes [][]color.RGBA, leafCounts []uint16, curPal *int, usedInPal *int, jobs *[]leafJob) error {
 	isLeaf, err := br.ReadBit()
 	if err != nil {
 		return err
 	}
 	if isLeaf {
-		// Читаем локальный индекс цвета (uint8) и определяем текущую палитру по номеру листа.
+		// Читаем локальный индекс цвета (uint8) и определяем текущую палитру по счётчику листьев.
 		b, err := br.ReadByte()
 		if err != nil {
 			return err
 		}
-		palID := *leafCounter / 256
-		if palID < 0 || palID >= len(palettes) {
-			return fmt.Errorf("decodeRegionJobs: palette id %d out of range", palID)
+
+		// При необходимости переходим к следующей палитре, если текущая уже исчерпала свои листья.
+		for *curPal < len(palettes) && *usedInPal >= int(leafCounts[*curPal]) {
+			*curPal++
+			*usedInPal = 0
 		}
+		if *curPal >= len(palettes) {
+			return fmt.Errorf("decodeRegionJobs: palette id %d out of range", *curPal)
+		}
+
+		palID := *curPal
 		local := int(b)
 		if local < 0 || local >= len(palettes[palID]) {
 			return fmt.Errorf("decodeRegionJobs: local color index %d out of range for palette %d", local, palID)
@@ -769,7 +790,7 @@ func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palett
 			pal: palID,
 			idx: local,
 		})
-		*leafCounter++
+		*usedInPal++
 		return nil
 	}
 
@@ -777,10 +798,10 @@ func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palett
 	if w >= h && w/2 >= params.minBlock {
 		w1 := w / 2
 		w2 := w - w1
-		if err := decodeRegionJobs(x, y, w1, h, params, br, palettes, leafCounter, jobs); err != nil {
+		if err := decodeRegionJobs(x, y, w1, h, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
 			return err
 		}
-		if err := decodeRegionJobs(x+w1, y, w2, h, params, br, palettes, leafCounter, jobs); err != nil {
+		if err := decodeRegionJobs(x+w1, y, w2, h, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
 			return err
 		}
 	} else {
@@ -793,10 +814,16 @@ func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palett
 			if err != nil {
 				return err
 			}
-			palID := *leafCounter / 256
-			if palID < 0 || palID >= len(palettes) {
-				return fmt.Errorf("decodeRegionJobs: palette id %d out of range (fallback)", palID)
+
+			for *curPal < len(palettes) && *usedInPal >= int(leafCounts[*curPal]) {
+				*curPal++
+				*usedInPal = 0
 			}
+			if *curPal >= len(palettes) {
+				return fmt.Errorf("decodeRegionJobs: palette id %d out of range (fallback)", *curPal)
+			}
+
+			palID := *curPal
 			local := int(b)
 			if local < 0 || local >= len(palettes[palID]) {
 				return fmt.Errorf("decodeRegionJobs: local color index %d out of range for palette %d (fallback)", local, palID)
@@ -809,13 +836,13 @@ func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palett
 				pal: palID,
 				idx: local,
 			})
-			*leafCounter++
+			*usedInPal++
 			return nil
 		}
-		if err := decodeRegionJobs(x, y, w, h1, params, br, palettes, leafCounter, jobs); err != nil {
+		if err := decodeRegionJobs(x, y, w, h1, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
 			return err
 		}
-		if err := decodeRegionJobs(x, y+h1, w, h2, params, br, palettes, leafCounter, jobs); err != nil {
+		if err := decodeRegionJobs(x, y+h1, w, h2, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
 			return err
 		}
 	}
