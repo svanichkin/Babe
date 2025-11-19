@@ -260,8 +260,6 @@ type leafColor struct {
 	c color.RGBA
 }
 
-type leafIdx uint16
-
 type leafJob struct {
 	x, y, w, h int
 	pal        int // индекс палитры
@@ -327,10 +325,6 @@ func splitStripes(totalH, minBlock int) []stripeInfo {
 		y += h
 	}
 	return stripes
-}
-
-func rgbKey(c color.RGBA) uint32 {
-	return uint32(c.R)<<16 | uint32(c.G)<<8 | uint32(c.B)
 }
 
 // простая мапа quality -> параметры.
@@ -667,72 +661,6 @@ func buildPalettes(leaves []leafColor, params codec2Params) ([]palette, []leafRe
 	}
 
 	return pals, refs, nil
-}
-
-func buildPalette(leaves []leafColor, params codec2Params) ([]color.RGBA, []leafIdx, error) {
-	// Мы хотим приблизиться к идее "локальных" палитр по 256 листьев:
-	// каждые 256 листьев формируют свою маленькую палитру, но наружу мы по‑прежнему
-	// отдаём одну глобальную палитру и глобальные индексы (uint16), чтобы не ломать формат.
-	//
-	// Для каждой группы из максимум 256 листьев мы собираем локальную палитру:
-	// - ищем "близкий" цвет в пределах этой группы (closeColor + colorTol),
-	// - при необходимости добавляем новый цвет в ГЛОБАЛЬНУЮ палитру,
-	// - храним для локального индекса ссылку на глобальный индекс.
-	//
-	// В итоге:
-	// - разные группы не смешивают цвета между собой (лучше локальность),
-	// - глобальная палитра может расти до 65535 цветов (как и раньше),
-	// - формат encode/decode остаётся прежним.
-
-	globalPalette := make([]color.RGBA, 0, len(leaves))
-	indexPairs := make([]leafIdx, len(leaves))
-
-	const groupSize = 256
-
-	for base := 0; base < len(leaves); base += groupSize {
-		end := base + groupSize
-		if end > len(leaves) {
-			end = len(leaves)
-		}
-
-		// Локальная палитра для текущей группы листьев.
-		localColors := make([]color.RGBA, 0, end-base)
-		localToGlobal := make([]leafIdx, 0, end-base)
-
-		for i := base; i < end; i++ {
-			c := leaves[i].c
-
-			// Ищем близкий цвет в локальной палитре этой группы.
-			found := -1
-			for j, lc := range localColors {
-				if closeColor(c, lc, params.colorTol) {
-					found = j
-					break
-				}
-			}
-
-			var gidx leafIdx
-			if found >= 0 {
-				// Используем уже существующий глобальный индекс,
-				// сопоставленный с этим локальным цветом.
-				gidx = localToGlobal[found]
-			} else {
-				// Новый цвет: добавляем его в глобальную палитру
-				// и связываем с локальной палитрой.
-				if len(globalPalette) >= 0xFFFF {
-					return nil, nil, fmt.Errorf("palette too large")
-				}
-				gidx = leafIdx(len(globalPalette))
-				globalPalette = append(globalPalette, c)
-				localColors = append(localColors, c)
-				localToGlobal = append(localToGlobal, gidx)
-			}
-
-			indexPairs[i] = gidx
-		}
-	}
-
-	return globalPalette, indexPairs, nil
 }
 
 // -----------------------------------------------------------------------------
