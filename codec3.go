@@ -327,12 +327,20 @@ func luma(c color.RGBA) int32 {
 	return (299*int32(c.R) + 587*int32(c.G) + 114*int32(c.B) + 500) / 1000
 }
 
-// analyzeBlock computes both the energy (luma spread) and average color in a single scan.
-func analyzeBlock(img *image.RGBA, x, y, w, h int) (energy int32, avg color.RGBA) {
+// analyzeBlock computes the total, border, and inner energy (luma spread) and average color in a single scan.
+func analyzeBlock(img *image.RGBA, x, y, w, h int) (totalEnergy int32, borderEnergy int32, innerEnergy int32, avg color.RGBA) {
 	b := img.Bounds()
 
 	var minL int32 = 255
 	var maxL int32 = 0
+
+	var minLBorder int32 = 255
+	var maxLBorder int32 = 0
+	var minLInner int32 = 255
+	var maxLInner int32 = 0
+
+	var haveBorder, haveInner bool
+
 	var sumR, sumG, sumB int64
 	var count int64
 
@@ -345,12 +353,35 @@ func analyzeBlock(img *image.RGBA, x, y, w, h int) (energy int32, avg color.RGBA
 			}
 			c := img.RGBAAt(px, py)
 			l := luma(c)
+
+			// Общая энергия по блоку.
 			if l < minL {
 				minL = l
 			}
 			if l > maxL {
 				maxL = l
 			}
+
+			// Проверяем, принадлежит ли пиксель границе блока.
+			isBorder := xx == 0 || yy == 0 || xx == w-1 || yy == h-1
+			if isBorder {
+				if l < minLBorder {
+					minLBorder = l
+				}
+				if l > maxLBorder {
+					maxLBorder = l
+				}
+				haveBorder = true
+			} else {
+				if l < minLInner {
+					minLInner = l
+				}
+				if l > maxLInner {
+					maxLInner = l
+				}
+				haveInner = true
+			}
+
 			sumR += int64(c.R)
 			sumG += int64(c.G)
 			sumB += int64(c.B)
@@ -359,17 +390,24 @@ func analyzeBlock(img *image.RGBA, x, y, w, h int) (energy int32, avg color.RGBA
 	}
 
 	if count == 0 {
-		return 0, color.RGBA{0, 0, 0, 255}
+		return 0, 0, 0, color.RGBA{0, 0, 0, 255}
 	}
 
-	e := maxL - minL
+	totalEnergy = maxL - minL
+	if haveBorder {
+		borderEnergy = maxLBorder - minLBorder
+	}
+	if haveInner {
+		innerEnergy = maxLInner - minLInner
+	}
+
 	avg = color.RGBA{
 		R: uint8(sumR / count),
 		G: uint8(sumG / count),
 		B: uint8(sumB / count),
 		A: 255,
 	}
-	return e, avg
+	return totalEnergy, borderEnergy, innerEnergy, avg
 }
 
 // collectRegionColorsStriped запускает collectRegionColors независимо для нескольких вертикальных полос
@@ -444,20 +482,32 @@ func collectRegionColors(img *image.RGBA, x, y, w, h int, params codec2Params, l
 	// 1) Базовое условие по размеру — сразу лист.
 	if w <= params.minBlock && h <= params.minBlock {
 		*pattern = append(*pattern, true)
-		_, avg := analyzeBlock(img, x, y, w, h)
+		_, _, _, avg := analyzeBlock(img, x, y, w, h)
 		*leaves = append(*leaves, leafColor{c: avg})
 		return nil
 	}
 
 	// 2) Оцениваем "шероховатость" блока и одновременно считаем средний цвет.
-	energy, avg := analyzeBlock(img, x, y, w, h)
+	energy, borderEnergy, innerEnergy, avg := analyzeBlock(img, x, y, w, h)
 	if energy == 0 {
 		// Идеально ровный блок - лист.
 		*pattern = append(*pattern, true)
 		*leaves = append(*leaves, leafColor{c: avg})
 		return nil
 	}
-	if energy <= params.maxGrad && w <= 4*params.minBlock && h <= 4*params.minBlock {
+
+	// Определяем, не является ли блок "краевым": когда большая часть контраста
+	// сосредоточена именно на границе блока, а внутри относительно ровно.
+	edgeDominated := false
+	if borderEnergy > 0 && innerEnergy > 0 {
+		// Если энергия на границе заметно превышает внутреннюю, и блок ещё достаточно крупный,
+		// имеет смысл делить его дальше, чтобы граница объекта проходила по более мелким блокам.
+		if borderEnergy >= innerEnergy*2 && (w > params.minBlock*2 || h > params.minBlock*2) {
+			edgeDominated = true
+		}
+	}
+
+	if !edgeDominated && energy <= params.maxGrad && w <= 4*params.minBlock && h <= 4*params.minBlock {
 		// Блок достаточно гладкий И уже не гигантский — лист.
 		*pattern = append(*pattern, true)
 		*leaves = append(*leaves, leafColor{c: avg})
@@ -487,7 +537,7 @@ func collectRegionColors(img *image.RGBA, x, y, w, h int, params codec2Params, l
 	if h1 < params.minBlock {
 		// Слишком маленький для деления блок — принудительно лист.
 		*pattern = append(*pattern, true)
-		_, avg := analyzeBlock(img, x, y, w, h)
+		_, _, _, avg := analyzeBlock(img, x, y, w, h)
 		*leaves = append(*leaves, leafColor{c: avg})
 		return nil
 	}
@@ -980,16 +1030,27 @@ func smoothEdges(src *image.RGBA, tol int) *image.RGBA {
 			// - небольшие перепады -> среднее сглаживание
 			// - средние/большие перепады -> более сильное сглаживание, чтобы убрать "зубья"
 			var alpha float64
+			// switch {
+			// case maxDl < tol*2:
+			// 	// слабая граница — лёгкое сглаживание
+			// 	alpha = 0.4
+			// case maxDl < tol*4:
+			// 	// нормальная граница — заметное сглаживание
+			// 	alpha = 0.6
+			// default:
+			// 	// очень контрастная граница — тоже сглаживаем ощутимо, но не до мыла
+			// 	alpha = 0.5
+			// }
 			switch {
-			case maxDl < tol*2:
+			case maxDl < tol*3:
 				// слабая граница — лёгкое сглаживание
 				alpha = 0.4
-			case maxDl < tol*4:
+			case maxDl < tol*5:
 				// нормальная граница — заметное сглаживание
-				alpha = 0.6
+				alpha = 0.3
 			default:
 				// очень контрастная граница — тоже сглаживаем ощутимо, но не до мыла
-				alpha = 0.5
+				alpha = 0.1
 			}
 
 			// Итоговый цвет: смесь исходного и среднего по соседям.
