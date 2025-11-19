@@ -120,18 +120,35 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 		}
 	}
 
-	// 4) Второй проход: кодируем дерево и паттерны с индексами по тем же полосам, что и в collectRegionColorsStriped.
-	bw := NewBitWriter(&raw)
+	// 4) Второй проход: кодируем дерево и индексы по тем же полосам, что и в collectRegionColorsStriped.
+	// Структуру дерева пишем в отдельный буфер, а индексы листьев — в другой.
+	var treeBuf bytes.Buffer
+	var leafBuf bytes.Buffer
+
+	bw := NewBitWriter(&treeBuf)
 	leafPos := 0
 	patPos := 0
 
 	stripes := splitStripes(int(h), params.minBlock)
 	for _, s := range stripes {
-		if err := encodeRegion(rgba, 0, s.y, int(w), s.h, params, bw, leafLocal, &leafPos, pattern, &patPos); err != nil {
+		if err := encodeRegion(rgba, 0, s.y, int(w), s.h, params, bw, leafLocal, &leafPos, pattern, &patPos, &leafBuf); err != nil {
 			return nil, err
 		}
 	}
 	if err := bw.Flush(); err != nil {
+		return nil, err
+	}
+
+	// После дерева и индексов собираем итоговый поток:
+	// [ uint16 numPalettes + (palettes...) ][ uint32 treeLen ][ treeBits ][ leafIndices ].
+	treeBytes := treeBuf.Bytes()
+	if err := binary.Write(&raw, binary.BigEndian, uint32(len(treeBytes))); err != nil {
+		return nil, err
+	}
+	if _, err := raw.Write(treeBytes); err != nil {
+		return nil, err
+	}
+	if _, err := raw.Write(leafBuf.Bytes()); err != nil {
 		return nil, err
 	}
 
@@ -235,12 +252,25 @@ func Decode(data []byte) (image.Image, error) {
 		palettes[i] = p
 	}
 
-	// остаток — битстрим дерева и паттернов
-	offset := len(plain) - reader.Len()
-	if offset < 0 || offset > len(plain) {
-		return nil, fmt.Errorf("codec2: invalid palette offset")
+	// Далее в потоке: uint32 длина битстрима дерева, затем сами биты дерева, затем байты индексов листьев.
+	var treeLen uint32
+	if err := binary.Read(reader, binary.BigEndian, &treeLen); err != nil {
+		return nil, err
 	}
-	br := NewBitReaderFromBytes(plain[offset:])
+	if int(treeLen) < 0 || int(treeLen) > reader.Len() {
+		return nil, fmt.Errorf("codec2: invalid tree length")
+	}
+	treeBytes := make([]byte, treeLen)
+	if _, err := io.ReadFull(reader, treeBytes); err != nil {
+		return nil, err
+	}
+	leafBytes, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	br := NewBitReaderFromBytes(treeBytes)
+	leafPos := 0
 
 	// Первый этап: последовательно читаем дерево по тем же вертикальным полосам
 	// и собираем список листьев.
@@ -250,7 +280,7 @@ func Decode(data []byte) (image.Image, error) {
 	curPal := 0
 	usedInPal := 0
 	for _, s := range stripes {
-		if err := decodeRegionJobs(0, s.y, w, s.h, params, br, palettes, leafCounts, &curPal, &usedInPal, &jobs); err != nil {
+		if err := decodeRegionJobs(0, s.y, w, s.h, params, br, palettes, leafCounts, &curPal, &usedInPal, leafBytes, &leafPos, &jobs); err != nil {
 			return nil, err
 		}
 	}
@@ -381,6 +411,27 @@ func toRGBA(src image.Image) *image.RGBA {
 func luma(c color.RGBA) int32 {
 	// Rec. 601-type weights.
 	return (299*int32(c.R) + 587*int32(c.G) + 114*int32(c.B) + 500) / 1000
+}
+
+// rgbToYCoCg converts an RGBA color into integer YCoCg components.
+// This is a reversible transform in theory; здесь нам важны только относительные расстояния.
+func rgbToYCoCg(c color.RGBA) (y, co, cg int32) {
+	r := int32(c.R)
+	g := int32(c.G)
+	b := int32(c.B)
+
+	co = r - b
+	tmp := b + co/2
+	cg = g - tmp
+	y = tmp + cg/2
+	return y, co, cg
+}
+
+func abs32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // analyzeBlock computes the total, border, and inner energy (luma spread) and average color in a single scan.
@@ -610,30 +661,30 @@ func collectRegionColors(img *image.RGBA, x, y, w, h int, params codec2Params, l
 	return nil
 }
 
-// closeColor returns true if colors a and b are "close enough" (approximate match).
+// closeColor returns true if colors a and b are "close enough" (approximate match),
+// но сравнение делается в пространстве YCoCg, а не в исходном RGB.
+// tol интерпретируется как допуск по цветовым каналам (Co/Cg), а по яркости
+// допускаем немного больший разброс.
 func closeColor(a, b color.RGBA, tol int) bool {
-	dr := int(a.R) - int(b.R)
-	if dr < 0 {
-		dr = -dr
-	}
-	dg := int(a.G) - int(b.G)
-	if dg < 0 {
-		dg = -dg
-	}
-	db := int(a.B) - int(b.B)
-	if db < 0 {
-		db = -db
-	}
-	return dr <= tol && dg <= tol && db <= tol
+	ya, coa, cga := rgbToYCoCg(a)
+	yb, cob, cgb := rgbToYCoCg(b)
+
+	dY := abs32(ya - yb)
+	dCo := abs32(coa - cob)
+	dCg := abs32(cga - cgb)
+
+	// Яркость можно допускать чуть сильнее, чем цветовой сдвиг.
+	yTol := int32(tol * 2)
+	cTol := int32(tol)
+
+	return dY <= yTol && dCo <= cTol && dCg <= cTol
 }
 
 // buildPalettes строит набор локальных палитр и ссылок на цвета для каждого листа.
-// Идея: каждые 256 листьев начинается новая палитра. Это упрощает логику:
-// - максимум 256 листьев на одну палитру => не переполняем uint8 индекс
-// - многие палитры будут маленькими, но это не критично для экспериментов.
-//
-// Пока функция нигде не используется в боевом коде и служит подготовкой
-// под многопалитровый формат.
+// Мы накапливаем цвета в текущей палитре до тех пор, пока не появится новый
+// "достаточно отличный" цвет и в палитре уже 256 уникальных значений — тогда
+// заводим новую палитру. Таким образом, одна палитра хранит не более 256 цветов,
+// а цвета внутри неё сгруппированы по близости (в пространстве YCoCg).
 func buildPalettes(leaves []leafColor, params codec2Params) ([]palette, []leafRef, error) {
 	if len(leaves) == 0 {
 		return nil, nil, nil
@@ -683,7 +734,7 @@ func buildPalettes(leaves []leafColor, params codec2Params) ([]palette, []leafRe
 
 // encodeRegion рекурсивно кодирует прямоугольник (x,y,w,h) по заранее вычисленному дереву (pattern).
 // pattern: []bool, где каждый бит указывает, является ли данный узел листом (true) или внутренним (false).
-func encodeRegion(img *image.RGBA, x, y, w, h int, params codec2Params, bw *BitWriter, leafLocal []uint8, leafPos *int, pattern []bool, patPos *int) error {
+func encodeRegion(img *image.RGBA, x, y, w, h int, params codec2Params, bw *BitWriter, leafLocal []uint8, leafPos *int, pattern []bool, patPos *int, leafBuf *bytes.Buffer) error {
 	// На каждом узле читаем заранее принятие решение: лист или внутренний узел.
 	if *patPos >= len(pattern) {
 		return fmt.Errorf("encodeRegion: pattern overflow")
@@ -692,13 +743,22 @@ func encodeRegion(img *image.RGBA, x, y, w, h int, params codec2Params, bw *BitW
 	*patPos++
 
 	if isLeaf {
-		// Лист: берём следующий локальный индекс цвета и кодируем лист.
+		// Лист: берём следующий локальный индекс цвета, пишем бит "лист" в дерево
+		// и сам индекс — в отдельный байтовый поток.
 		if *leafPos >= len(leafLocal) {
 			return fmt.Errorf("encodeRegion: leaf index overflow")
 		}
 		local := leafLocal[*leafPos]
 		*leafPos++
-		return encodeLeaf(bw, local)
+		// помечаем лист в дереве
+		if err := bw.WriteBit(true); err != nil {
+			return err
+		}
+		// сохраняем индекс цвета в отдельный поток
+		if err := leafBuf.WriteByte(local); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	// Внутренний узел: пишем бит 0 и делим блок так же, как в collectRegionColors/decodeRegionJobs.
@@ -710,10 +770,10 @@ func encodeRegion(img *image.RGBA, x, y, w, h int, params codec2Params, bw *BitW
 		// Делим по ширине.
 		w1 := w / 2
 		w2 := w - w1
-		if err := encodeRegion(img, x, y, w1, h, params, bw, leafLocal, leafPos, pattern, patPos); err != nil {
+		if err := encodeRegion(img, x, y, w1, h, params, bw, leafLocal, leafPos, pattern, patPos, leafBuf); err != nil {
 			return err
 		}
-		if err := encodeRegion(img, x+w1, y, w2, h, params, bw, leafLocal, leafPos, pattern, patPos); err != nil {
+		if err := encodeRegion(img, x+w1, y, w2, h, params, bw, leafLocal, leafPos, pattern, patPos, leafBuf); err != nil {
 			return err
 		}
 		return nil
@@ -728,45 +788,33 @@ func encodeRegion(img *image.RGBA, x, y, w, h int, params codec2Params, bw *BitW
 		return fmt.Errorf("encodeRegion: inconsistent pattern/geometry (h1 < minBlock for internal node)")
 	}
 
-	if err := encodeRegion(img, x, y, w, h1, params, bw, leafLocal, leafPos, pattern, patPos); err != nil {
+	if err := encodeRegion(img, x, y, w, h1, params, bw, leafLocal, leafPos, pattern, patPos, leafBuf); err != nil {
 		return err
 	}
-	if err := encodeRegion(img, x, y+h1, w, h2, params, bw, leafLocal, leafPos, pattern, patPos); err != nil {
+	if err := encodeRegion(img, x, y+h1, w, h2, params, bw, leafLocal, leafPos, pattern, patPos, leafBuf); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func encodeLeaf(bw *BitWriter, local uint8) error {
-	// 1) помечаем лист.
-	if err := bw.WriteBit(true); err != nil { // 1 = leaf
-		return err
-	}
-	// 2) пишем локальный индекс цвета (0..255) в текущей палитре.
-	if err := bw.WriteByte(local); err != nil {
-		return err
-	}
-	// 3) Паттерн полностью убран из формата, поэтому никаких дополнительных бит
-	// не пишем. Вся информация о блоке — это его положение/размер в дереве +
-	// индекс палитры, который определяется порядковым номером листа.
-	return nil
-}
 
 // decodeRegionJobs зеркален decodeRegion, но вместо отрисовки листьев
 // собирает список "работ" по заливке блоков цветом. Это позволяет
 // считать битстрим последовательно, а рисовать блоки — параллельно.
-func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palettes [][]color.RGBA, leafCounts []uint16, curPal *int, usedInPal *int, jobs *[]leafJob) error {
+func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palettes [][]color.RGBA, leafCounts []uint16, curPal *int, usedInPal *int, leafBytes []byte, leafPos *int, jobs *[]leafJob) error {
 	isLeaf, err := br.ReadBit()
 	if err != nil {
 		return err
 	}
 	if isLeaf {
-		// Читаем локальный индекс цвета (uint8) и определяем текущую палитру по счётчику листьев.
-		b, err := br.ReadByte()
-		if err != nil {
-			return err
+		// Читаем локальный индекс цвета (uint8) из отдельного потока индексов
+		// и определяем текущую палитру по счётчику листьев.
+		if *leafPos >= len(leafBytes) {
+			return fmt.Errorf("decodeRegionJobs: leaf index stream underflow")
 		}
+		b := leafBytes[*leafPos]
+		*leafPos++
 
 		// При необходимости переходим к следующей палитре, если текущая уже исчерпала свои листья.
 		for *curPal < len(palettes) && *usedInPal >= int(leafCounts[*curPal]) {
@@ -798,10 +846,10 @@ func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palett
 	if w >= h && w/2 >= params.minBlock {
 		w1 := w / 2
 		w2 := w - w1
-		if err := decodeRegionJobs(x, y, w1, h, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
+		if err := decodeRegionJobs(x, y, w1, h, params, br, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
 			return err
 		}
-		if err := decodeRegionJobs(x+w1, y, w2, h, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
+		if err := decodeRegionJobs(x+w1, y, w2, h, params, br, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
 			return err
 		}
 	} else {
@@ -810,10 +858,11 @@ func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palett
 		if h1 <= 0 {
 			// Должно совпадать с логикой encodeRegion, но на всякий случай
 			// считаем всё как один лист.
-			b, err := br.ReadByte()
-			if err != nil {
-				return err
+			if *leafPos >= len(leafBytes) {
+				return fmt.Errorf("decodeRegionJobs: leaf index stream underflow (fallback)")
 			}
+			b := leafBytes[*leafPos]
+			*leafPos++
 
 			for *curPal < len(palettes) && *usedInPal >= int(leafCounts[*curPal]) {
 				*curPal++
@@ -839,10 +888,10 @@ func decodeRegionJobs(x, y, w, h int, params codec2Params, br *BitReader, palett
 			*usedInPal++
 			return nil
 		}
-		if err := decodeRegionJobs(x, y, w, h1, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
+		if err := decodeRegionJobs(x, y, w, h1, params, br, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
 			return err
 		}
-		if err := decodeRegionJobs(x, y+h1, w, h2, params, br, palettes, leafCounts, curPal, usedInPal, jobs); err != nil {
+		if err := decodeRegionJobs(x, y+h1, w, h2, params, br, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
 			return err
 		}
 	}
