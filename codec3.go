@@ -11,8 +11,8 @@ import (
 	"io"
 	"math"
 	"runtime"
-	"sync"
 	"sort"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -22,6 +22,31 @@ const (
 )
 
 var encoderStripes = 1 //runtime.NumCPU()
+
+func paramsForQuality(q int) codec2Params {
+	if q < 1 {
+		q = 1
+	}
+	if q > 100 {
+		q = 100
+	}
+
+	qi := 100 - q
+
+	params := codec2Params{
+		minBlock:           1 + int(float64(qi)*(4.0/100.0)),
+		maxGrad:            int32(ExpMap(qi, 99, 0, 150, 1, -4.0)),
+		colorTol:           ExpMap(qi, 99, 0, 7, 1, -3.0),
+		patternGainPercent: ExpMap(q, 1, 100, 0, 100, 3.0), // по умолчанию: паттерн должен быть лучше на 50%
+	}
+	fmt.Printf("minBlock=%d, maxGrad=%d, colorTol=%d, patternFactor=%d\n",
+		params.minBlock,
+		params.maxGrad,
+		params.colorTol,
+		params.patternGainPercent,
+	)
+	return params
+}
 
 // Encode encodes the given image with the given quality (1–100).
 // Higher quality => smaller allowed luma spread => больше блоков, но лучше детализация.
@@ -65,7 +90,7 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	}
 
 	// Считаем, сколько листьев пришлось на каждую палитру (для декодера).
-	leafCounts := make([]uint16, len(pals))
+	leafCounts := make([]uint32, len(pals))
 	for _, r := range refs {
 		pid := int(r.pal)
 		if pid < 0 || pid >= len(pals) {
@@ -99,9 +124,15 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 		// Дельта-кодирование палитры по ПРЕДЫДУЩЕМУ цвету для уже отсортированных массивов
 		if len(p.colors) > 0 {
 			y0, co0, cg0 := packYCoCg(p.colors[0])
-			if err := raw.WriteByte(y0); err != nil { return nil, err }
-			if err := raw.WriteByte(co0); err != nil { return nil, err }
-			if err := raw.WriteByte(cg0); err != nil { return nil, err }
+			if err := raw.WriteByte(y0); err != nil {
+				return nil, err
+			}
+			if err := raw.WriteByte(co0); err != nil {
+				return nil, err
+			}
+			if err := raw.WriteByte(cg0); err != nil {
+				return nil, err
+			}
 
 			prevY := int(y0)
 			prevCo := int(co0)
@@ -114,13 +145,31 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 				dco := int(co) - prevCo
 				dcg := int(cg) - prevCg
 
-				if dy < -128 { dy = -128 } else if dy > 127 { dy = 127 }
-				if dco < -128 { dco = -128 } else if dco > 127 { dco = 127 }
-				if dcg < -128 { dcg = -128 } else if dcg > 127 { dcg = 127 }
+				if dy < -128 {
+					dy = -128
+				} else if dy > 127 {
+					dy = 127
+				}
+				if dco < -128 {
+					dco = -128
+				} else if dco > 127 {
+					dco = 127
+				}
+				if dcg < -128 {
+					dcg = -128
+				} else if dcg > 127 {
+					dcg = 127
+				}
 
-				if err := raw.WriteByte(byte(dy + 128)); err != nil { return nil, err }
-				if err := raw.WriteByte(byte(dco + 128)); err != nil { return nil, err }
-				if err := raw.WriteByte(byte(dcg + 128)); err != nil { return nil, err }
+				if err := raw.WriteByte(byte(dy + 128)); err != nil {
+					return nil, err
+				}
+				if err := raw.WriteByte(byte(dco + 128)); err != nil {
+					return nil, err
+				}
+				if err := raw.WriteByte(byte(dcg + 128)); err != nil {
+					return nil, err
+				}
 
 				prevY = int(y)
 				prevCo = int(co)
@@ -157,8 +206,25 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	// После палитр собираем итоговый поток:
 	// [ uint32 treeLen ][ treeBits ][ uint32 leafLen ][ leafIndices ][ uint32 patLen ][ patBits ].
 	treeBytes := treeBuf.Bytes()
-	leafBytes := leafBuf.Bytes()
+	rawLeafBytes := leafBuf.Bytes()
 	patBytes := patBuf.Bytes()
+
+	// leafBytes := rawLeafBytes
+
+	// Delta-encode leaf index stream losslessly (mod 256).
+	// Первый байт пишем как есть, далее храним разность по модулю 256.
+	leafBytes := make([]byte, len(rawLeafBytes))
+	if len(rawLeafBytes) > 0 {
+		leafBytes[0] = rawLeafBytes[0]
+		prev := int(rawLeafBytes[0])
+		for i := 1; i < len(rawLeafBytes); i++ {
+			cur := int(rawLeafBytes[i])
+			// delta = (cur - prev) mod 256
+			delta := (cur - prev) & 0xFF
+			leafBytes[i] = byte(delta)
+			prev = cur
+		}
+	}
 
 	// Debug: размеры секций (до zstd)
 	var palettesBytes int
@@ -232,7 +298,7 @@ func Decode(data []byte) (image.Image, error) {
 		return nil, err
 	}
 	palettes := make([][]color.RGBA, numPalettes)
-	leafCounts := make([]uint16, numPalettes)
+	leafCounts := make([]uint32, numPalettes)
 	for i := 0; i < int(numPalettes); i++ {
 		if err := binary.Read(reader, binary.BigEndian, &leafCounts[i]); err != nil {
 			return nil, err
@@ -272,9 +338,21 @@ func Decode(data []byte) (image.Image, error) {
 				co := prevCo + dco
 				cg := prevCg + dcg
 
-				if y < 0 { y = 0 } else if y > 255 { y = 255 }
-				if co < 0 { co = 0 } else if co > 255 { co = 255 }
-				if cg < 0 { cg = 0 } else if cg > 255 { cg = 255 }
+				if y < 0 {
+					y = 0
+				} else if y > 255 {
+					y = 255
+				}
+				if co < 0 {
+					co = 0
+				} else if co > 255 {
+					co = 255
+				}
+				if cg < 0 {
+					cg = 0
+				} else if cg > 255 {
+					cg = 255
+				}
 
 				p[j] = unpackYCoCg(byte(y), byte(co), byte(cg))
 
@@ -309,9 +387,25 @@ func Decode(data []byte) (image.Image, error) {
 	if int(leafLen) < 0 || int(leafLen) > reader.Len() {
 		return nil, fmt.Errorf("codec2: invalid leaf length")
 	}
-	leafBytes := make([]byte, leafLen)
-	if _, err := io.ReadFull(reader, leafBytes); err != nil {
+	encLeafBytes := make([]byte, leafLen)
+	if _, err := io.ReadFull(reader, encLeafBytes); err != nil {
 		return nil, err
+	}
+
+	// leafBytes := encLeafBytes
+
+	// Delta-decode leaf index stream back to original indices (mod 256).
+	leafBytes := make([]byte, leafLen)
+	if leafLen > 0 {
+		leafBytes[0] = encLeafBytes[0]
+		prev := int(leafBytes[0])
+		for i := 1; i < int(leafLen); i++ {
+			delta := int(encLeafBytes[i]) // 0..255
+			// cur = (prev + delta) mod 256
+			cur := (prev + delta) & 0xFF
+			leafBytes[i] = byte(cur)
+			prev = cur
+		}
 	}
 
 	var patLen uint32
@@ -334,11 +428,20 @@ func Decode(data []byte) (image.Image, error) {
 	// и собираем список листьев.
 	var jobs []leafJob
 	stripes := splitStripes(w, h, params.minBlock)
-	// Текущая палитра и количество уже использованных листьев в ней.
 	curPal := 0
 	usedInPal := 0
 	for _, s := range stripes {
-		if err := decodeRegionJobs(s.x, s.y, s.w, s.h, params, treeBr, patBr, dst, palettes, leafCounts, &curPal, &usedInPal, leafBytes, &leafPos, &jobs); err != nil {
+		if err := decodeRegionJobs(
+			s.x, s.y, s.w, s.h,
+			params,
+			treeBr, patBr,
+			dst,
+			palettes,
+			leafCounts,
+			&curPal, &usedInPal,
+			leafBytes, &leafPos,
+			&jobs,
+		); err != nil {
 			return nil, err
 		}
 	}
@@ -359,9 +462,10 @@ func Decode(data []byte) (image.Image, error) {
 
 // codec2Params управляет минимальным размером блока и максимально допустимой "шероховатостью" (энергией градиента).
 type codec2Params struct {
-	minBlock int   // минимальный размер стороны блока
-	maxGrad  int32 // максимально допустимая энергия градиента для "листа"
-	colorTol int   // допуск по цвету для слияния палитры (в значениях канала)
+	minBlock           int   // минимальный размер стороны блока
+	maxGrad            int32 // максимально допустимая энергия градиента для "листа"
+	colorTol           int   // допуск по цвету для слияния палитры (в значениях канала)
+	patternGainPercent int   // во сколько раз ошибка паттерна должна быть меньше solid (например: 2 = лучше на 50%)
 }
 
 type leafColor struct {
@@ -491,29 +595,6 @@ func splitStripes(totalW, totalH, minBlock int) []stripeInfo {
 		cur += seg
 	}
 	return stripes
-}
-
-func paramsForQuality(q int) codec2Params {
-	if q < 1 {
-		q = 1
-	}
-	if q > 100 {
-		q = 100
-	}
-
-	qi := 100 - q
-
-	params := codec2Params{
-		minBlock: 1 + int(float64(qi)*(4.0/100.0)),
-		maxGrad:  int32(ExpMap(qi, 99, 0, 150, 1, -4.0)),
-		colorTol: ExpMap(qi, 99, 0, 7, 1, -3.0),
-	}
-	fmt.Printf("minBlock=%d, maxGrad=%d, colorTol=%d\n",
-		params.minBlock,
-		params.maxGrad,
-		params.colorTol,
-	)
-	return params
 }
 
 // ExpMap преобразует вход x из диапазона [inMin..inMax]
@@ -830,15 +911,25 @@ func pickLeafModel(
 		}
 	}
 
+	// Требуемое относительное улучшение ошибки в процентах.
+	// patternGainPercent = 30 => errPattern < 0.7 * errSolid.
+	gain := params.patternGainPercent
+	if gain < 0 {
+		gain = 0
+	}
+	if gain > 99 {
+		gain = 99
+	}
+
+	// errPattern < (1 - gain/100) * errSolid
 	if stats != nil {
 		stats.total++
-		if errPattern*10 < errSolid*7 {
+		if errPattern*100 < errSolid*int64(100-gain) {
 			stats.patternBetter++
 		}
 	}
 
-	// Выбираем модель: считаем паттерн "существенно лучше", если ошибка меньше хотя бы на 30%.
-	if errPattern*10 < errSolid*7 {
+	if errPattern*100 < errSolid*int64(100-gain) {
 		return leafTypePattern, avg, patternLeaf{fg: fg, bg: bg}
 	}
 	return leafTypeSolid, avg, patternLeaf{}
@@ -1114,8 +1205,8 @@ func buildPalettes(leaves []leafColor, pattLeaves []patternLeaf, modes []leafTyp
 
 		// Подготовим структуру с исходным индексом и координатами YCoCg.
 		type ycColor struct {
-			oldIdx int
-			c      color.RGBA
+			oldIdx    int
+			c         color.RGBA
 			y, co, cg int32
 		}
 		ycs := make([]ycColor, len(colors))
@@ -1219,6 +1310,7 @@ func encodeRegion(
 			if err := bw.WriteBit(false); err != nil { // 0 = leafTypeSolid
 				return err
 			}
+			// В поток индексов пишем только локальный индекс цвета.
 			if err := leafBuf.WriteByte(r.idx); err != nil {
 				return err
 			}
@@ -1229,7 +1321,7 @@ func encodeRegion(
 			if err := bw.WriteBit(true); err != nil { // 1 = leafTypePattern
 				return err
 			}
-			// Индексы fg/bg в отдельный поток.
+			// В поток индексов пишем только локальные индексы fg/bg.
 			if err := leafBuf.WriteByte(r.fg); err != nil {
 				return err
 			}
@@ -1237,10 +1329,9 @@ func encodeRegion(
 				return err
 			}
 
-			// Генерируем паттерн на основе порога яркости, как в pickLeafModel/computeFG_BG.
+			// Генерируем паттерн на основе порога яркости, как раньше.
 			_, _, thr, ok := computeFG_BG(img, x, y, w, h)
 			if !ok {
-				// Если по какой-то причине блок пустой, пишем нули.
 				for i := 0; i < w*h; i++ {
 					if err := patBW.WriteBit(false); err != nil {
 						return err
@@ -1330,7 +1421,7 @@ func decodeRegionJobs(
 	patBr *BitReader,
 	dst *image.RGBA,
 	palettes [][]color.RGBA,
-	leafCounts []uint16,
+	leafCounts []uint32,
 	curPal *int,
 	usedInPal *int,
 	leafBytes []byte,
@@ -1348,7 +1439,7 @@ func decodeRegionJobs(
 			return err
 		}
 
-		// При необходимости переходим к следующей палитре, если текущая уже исчерпала свои листья.
+		// Определяем, к какой палитре относится этот лист, по leafCounts.
 		for *curPal < len(palettes) && *usedInPal >= int(leafCounts[*curPal]) {
 			*curPal++
 			*usedInPal = 0
