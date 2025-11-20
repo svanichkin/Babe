@@ -279,8 +279,10 @@ func Decode(data []byte) (image.Image, error) {
 	// Второй этап: параллельно заливаем блоки цветом.
 	paintLeafJobsParallel(dst, palettes, jobs)
 
-	// Лёгкое сглаживание на границах блоков.
-	smoothed := SmoothEdges(dst, int(params.maxGrad))
+	// Постпроцессинг блоков: мягкое сглаживание границ и стыков.
+	// Привязываем шаг сетки сглаживания к params.minBlock,
+	// чтобы не лезть внутрь блоков мельче минимального.
+	smoothed := smoothBlocks(dst, params.minBlock)
 	return smoothed, nil
 }
 
@@ -424,52 +426,6 @@ func splitStripes(totalW, totalH, minBlock int) []stripeInfo {
 	return stripes
 }
 
-// более агрессивное сжатие на низких качествах:
-// func paramsForQuality(q int) codec2Params {
-// 	if q < 1 {
-// 		q = 1
-// 	}
-// 	if q > 100 {
-// 		q = 100
-// 	}
-
-// 	// qi = "насколько мы далеки от максимального качества"
-// 	qi := 100 - q
-
-// 	// minBlock:
-// 	// - при высоком качестве оставляем 1
-// 	// - при средне-низком увеличиваем до 2
-// 	// - при совсем низком до 4
-// 	minBlock := 1
-// 	if qi > 40 {
-// 		minBlock = 2
-// 	}
-// 	if qi > 75 {
-// 		minBlock = 4
-// 	}
-
-// 	// maxGrad:
-// 	// раньше рос примерно линейно, сейчас делаем рост квадратичным,
-// 	// чтобы на низком качестве делить существенно реже.
-// 	maxGrad := int32(4 + (qi*qi)/25) // при q=100 -> 4, при q=50 -> ~54, при q=1 -> ~404
-
-// 	// colorTol:
-// 	// позволяем заметно более сильное "схлопывание" цветов на низких качествах.
-// 	colorTol := 1 + qi/3 // при q=100 -> 1, при q=50 -> ~17, при q=1 -> ~33
-
-// 	params := codec2Params{
-// 		minBlock: minBlock,
-// 		maxGrad:  maxGrad,
-// 		colorTol: colorTol,
-// 	}
-// 	fmt.Printf("minBlock=%d, maxGrad=%d, colorTol=%d\n",
-// 		params.minBlock,
-// 		params.maxGrad,
-// 		params.colorTol,
-// 	)
-// 	return params
-// }
-
 func paramsForQuality(q int) codec2Params {
 	if q < 1 {
 		q = 1
@@ -480,11 +436,10 @@ func paramsForQuality(q int) codec2Params {
 
 	qi := 100 - q
 
-	fmt.Printf("q=%d, qi=%d\n", q, qi)
 	params := codec2Params{
-		minBlock: 1 + int(float64(qi)*(3.0/100.0)),
-		maxGrad:  int32(ExpMap(qi, 99, 0, 100, 1, -4.0)),
-		colorTol: ExpMap(qi, 99, 0, 10, 1, -3.0),
+		minBlock: 1 + int(float64(qi)*(4.0/100.0)),
+		maxGrad:  int32(ExpMap(qi, 99, 0, 150, 1, -4.0)),
+		colorTol: ExpMap(qi, 99, 0, 7, 1, -3.0),
 	}
 	fmt.Printf("minBlock=%d, maxGrad=%d, colorTol=%d\n",
 		params.minBlock,
@@ -839,14 +794,44 @@ func collectRegionColors(
 
 	// 1) Базовое условие по размеру — сразу лист.
 	if w <= params.minBlock && h <= params.minBlock {
+		energy, _, _, avg := analyzeBlock(img, x, y, w, h)
+
+		// Если блок маленький, но всё ещё "жесткий" — насильно делим ещё, пока можем.
+		if energy > params.maxGrad && (w > 1 || h > 1) {
+			*pattern = append(*pattern, false) // внутренний узел
+
+			if w >= h && w > 1 {
+				w1 := w / 2
+				w2 := w - w1
+				if err := collectRegionColors(img, x, y, w1, h, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+					return err
+				}
+				if err := collectRegionColors(img, x+w1, y, w2, h, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+					return err
+				}
+				return nil
+			}
+
+			if h > 1 {
+				h1 := h / 2
+				h2 := h - h1
+				if err := collectRegionColors(img, x, y, w, h1, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+					return err
+				}
+				if err := collectRegionColors(img, x, y+h1, w, h2, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
+
+		// иначе — обычный лист
 		*pattern = append(*pattern, true)
-		_, _, _, avg := analyzeBlock(img, x, y, w, h)
 		mode, solid, patt := pickLeafModel(img, x, y, w, h, avg, params, stats)
 		if mode == leafTypePattern {
 			*pattLeaves = append(*pattLeaves, patt)
 		}
 		*modes = append(*modes, mode)
-		// Пока формат кодирования остаётся одноцветным, кладём в leaves усреднённый цвет.
 		*leaves = append(*leaves, leafColor{c: solid})
 		return nil
 	}
@@ -1166,7 +1151,10 @@ func encodeRegion(
 		return err
 	}
 
-	if w >= h && w/2 >= params.minBlock {
+	// Делим только по геометрии, без minBlock: это должно совпадать с веткой
+	// "усиленного деления" в collectRegionColors, где мы делим даже при размере
+	// меньше minBlock, пока w > 1 или h > 1.
+	if w >= h && w > 1 {
 		// Делим по ширине.
 		w1 := w / 2
 		w2 := w - w1
@@ -1179,23 +1167,22 @@ func encodeRegion(
 		return nil
 	}
 
-	// Иначе делим по высоте; сюда мы не попадём в тех случаях,
-	// когда collectRegionColors принудительно сделал лист (h1 < minBlock),
-	// потому что pattern для этого узла уже был true.
-	h1 := h / 2
-	h2 := h - h1
-	if h1 < params.minBlock {
-		return fmt.Errorf("encodeRegion: inconsistent pattern/geometry (h1 < minBlock for internal node)")
+	// Иначе делим по высоте (если можем).
+	if h > 1 {
+		h1 := h / 2
+		h2 := h - h1
+		if err := encodeRegion(img, x, y, w, h1, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
+			return err
+		}
+		if err := encodeRegion(img, x, y+h1, w, h2, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
+			return err
+		}
+		return nil
 	}
 
-	if err := encodeRegion(img, x, y, w, h1, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
-		return err
-	}
-	if err := encodeRegion(img, x, y+h1, w, h2, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
-		return err
-	}
-
-	return nil
+	// Если сюда попали, значит pattern пометил внутренний узел для блока,
+	// который уже нельзя делить геометрически — это логическая ошибка.
+	return fmt.Errorf("encodeRegion: internal node with non-divisible geometry (%d×%d)", w, h)
 }
 
 // decodeRegionJobs зеркален decodeRegion, но вместо отрисовки листьев
@@ -1297,8 +1284,8 @@ func decodeRegionJobs(
 		return nil
 	}
 
-	// Внутренний узел - делим так же, как в encodeRegion.
-	if w >= h && w/2 >= params.minBlock {
+	// Внутренний узел - делим так же, как в encodeRegion/collectRegionColors.
+	if w >= h && w > 1 {
 		w1 := w / 2
 		w2 := w - w1
 		if err := decodeRegionJobs(x, y, w1, h, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
@@ -1307,95 +1294,23 @@ func decodeRegionJobs(
 		if err := decodeRegionJobs(x+w1, y, w2, h, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
 			return err
 		}
-	} else {
+		return nil
+	}
+
+	if h > 1 {
 		h1 := h / 2
 		h2 := h - h1
-		if h1 <= 0 {
-			// Должно совпадать с логикой encodeRegion, но на всякий случай
-			// считаем всё как один лист.
-
-			typeBit, err := br.ReadBit()
-			if err != nil {
-				return err
-			}
-
-			for *curPal < len(palettes) && *usedInPal >= int(leafCounts[*curPal]) {
-				*curPal++
-				*usedInPal = 0
-			}
-			if *curPal >= len(palettes) {
-				*curPal = len(palettes) - 1
-			}
-			palID := *curPal
-
-			if !typeBit {
-				if *leafPos >= len(leafBytes) {
-					return fmt.Errorf("decodeRegionJobs: leaf index stream underflow (fallback)")
-				}
-				b := leafBytes[*leafPos]
-				*leafPos++
-
-				local := int(b)
-				if local < 0 || local >= len(palettes[palID]) {
-					return fmt.Errorf("decodeRegionJobs: local color index %d out of range for palette %d (fallback)", local, palID)
-				}
-				*jobs = append(*jobs, leafJob{
-					x:   x,
-					y:   y,
-					w:   w,
-					h:   h,
-					pal: palID,
-					idx: local,
-				})
-				*usedInPal++
-				return nil
-			}
-
-			// Паттерн-лист в fallback-ветке.
-			if *leafPos+1 >= len(leafBytes) {
-				return fmt.Errorf("decodeRegionJobs: pattern leaf index stream underflow (fallback)")
-			}
-			fgIdx := int(leafBytes[*leafPos])
-			bgIdx := int(leafBytes[*leafPos+1])
-			*leafPos += 2
-
-			if fgIdx < 0 || fgIdx >= len(palettes[palID]) || bgIdx < 0 || bgIdx >= len(palettes[palID]) {
-				return fmt.Errorf("decodeRegionJobs: fg/bg index out of range for palette %d (fallback)", palID)
-			}
-			fg := palettes[palID][fgIdx]
-			bg := palettes[palID][bgIdx]
-
-			bounds := dst.Bounds()
-			for yy := 0; yy < h; yy++ {
-				for xx := 0; xx < w; xx++ {
-					bit, err := patBr.ReadBit()
-					if err != nil {
-						return fmt.Errorf("decodeRegionJobs: pattern bitstream underflow (fallback): %w", err)
-					}
-					px := x + xx
-					py := y + yy
-					if px < bounds.Min.X || py < bounds.Min.Y || px >= bounds.Max.X || py >= bounds.Max.Y {
-						continue
-					}
-					if bit {
-						dst.SetRGBA(px, py, fg)
-					} else {
-						dst.SetRGBA(px, py, bg)
-					}
-				}
-			}
-			*usedInPal++
-			return nil
-		}
 		if err := decodeRegionJobs(x, y, w, h1, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
 			return err
 		}
 		if err := decodeRegionJobs(x, y+h1, w, h2, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
 			return err
 		}
+		return nil
 	}
 
-	return nil
+	// Встретили внутренний узел, который уже нельзя делить по геометрии.
+	return fmt.Errorf("decodeRegionJobs: internal node with non-divisible geometry (%d×%d)", w, h)
 }
 
 func paintLeafJobsParallel(dst *image.RGBA, palettes [][]color.RGBA, jobs []leafJob) {
@@ -1760,6 +1675,216 @@ func SmoothEdges(src *image.RGBA, tol int) *image.RGBA {
 	}
 
 	return dst
+}
+
+func luma(c color.RGBA) int32 {
+	return Luma(c)
+}
+
+// smoothJunctions performs gradient-based smoothing at intersections of blocks
+// with a given nominal blockSize (usually params.minBlock from the codec).
+func smoothJunctions(img *image.RGBA, blockSize int) *image.RGBA {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+
+	if blockSize <= 1 {
+		// сетка слишком плотная — фактически нет "квадратов"
+		return img
+	}
+
+	if w < 2*blockSize || h < 2*blockSize {
+		return img
+	}
+
+	maxRadius := blockSize
+	if maxRadius > 3 {
+		maxRadius = 3
+	}
+	const junctionLumaSpread int32 = 32
+	const lumaSimThreshold int32 = 8
+
+	similar := func(a, b color.RGBA) bool {
+		da := luma(a) - luma(b)
+		if da < 0 {
+			da = -da
+		}
+		return da <= lumaSimThreshold
+	}
+
+	lerp8 := func(a, b uint8, t float64) uint8 {
+		return uint8(float64(a)*(1-t) + float64(b)*t + 0.5)
+	}
+
+	for y := b.Min.Y + blockSize; y < b.Max.Y; y += blockSize {
+		for x := b.Min.X + blockSize; x < b.Max.X; x += blockSize {
+			c00 := img.RGBAAt(x-1, y-1)
+			c10 := img.RGBAAt(x, y-1)
+			c01 := img.RGBAAt(x-1, y)
+			c11 := img.RGBAAt(x, y)
+
+			l00 := luma(c00)
+			l10 := luma(c10)
+			l01 := luma(c01)
+			l11 := luma(c11)
+
+			minL, maxL := l00, l00
+			for _, v := range []int32{l10, l01, l11} {
+				if v < minL {
+					minL = v
+				}
+				if v > maxL {
+					maxL = v
+				}
+			}
+			if maxL-minL > junctionLumaSpread {
+				continue
+			}
+
+			L := 0
+			for i := 1; i <= maxRadius && x-i >= b.Min.X; i++ {
+				up := img.RGBAAt(x-i, y-1)
+				down := img.RGBAAt(x-i, y)
+				if !similar(up, c00) || !similar(down, c01) {
+					break
+				}
+				L = i
+			}
+
+			R := 0
+			for i := 1; i <= maxRadius && x-1+i < b.Max.X; i++ {
+				up := img.RGBAAt(x-1+i, y-1)
+				down := img.RGBAAt(x-1+i, y)
+				if !similar(up, c10) || !similar(down, c11) {
+					break
+				}
+				R = i
+			}
+
+			U := 0
+			for i := 1; i <= maxRadius && y-i >= b.Min.Y; i++ {
+				left := img.RGBAAt(x-1, y-i)
+				right := img.RGBAAt(x, y-i)
+				if !similar(left, c00) || !similar(right, c10) {
+					break
+				}
+				U = i
+			}
+
+			D := 0
+			for i := 1; i <= maxRadius && y-1+i < b.Max.Y; i++ {
+				left := img.RGBAAt(x-1, y-1+i)
+				right := img.RGBAAt(x, y-1+i)
+				if !similar(left, c01) || !similar(right, c11) {
+					break
+				}
+				D = i
+			}
+
+			if L == 0 || R == 0 || U == 0 || D == 0 {
+				continue
+			}
+
+			rectMinX := x - L
+			rectMaxX := x - 1 + R
+			rectMinY := y - U
+			rectMaxY := y - 1 + D
+
+			r00, g00, b00, a00 := c00.R, c00.G, c00.B, c00.A
+			r10, g10, b10, a10 := c10.R, c10.G, c10.B, c10.A
+			r01, g01, b01, a01 := c01.R, c01.G, c01.B, c01.A
+			r11, g11, b11, a11 := c11.R, c11.G, c11.B, c11.A
+
+			width := rectMaxX - rectMinX
+			height := rectMaxY - rectMinY
+
+			for py := rectMinY; py <= rectMaxY; py++ {
+				v := float64(py-rectMinY) / float64(height)
+				for px := rectMinX; px <= rectMaxX; px++ {
+					u := float64(px-rectMinX) / float64(width)
+
+					rTop := lerp8(r00, r10, u)
+					gTop := lerp8(g00, g10, u)
+					bTop := lerp8(b00, b10, u)
+					aTop := lerp8(a00, a10, u)
+
+					rBot := lerp8(r01, r11, u)
+					gBot := lerp8(g01, g11, u)
+					bBot := lerp8(b01, b11, u)
+					aBot := lerp8(a01, a11, u)
+
+					r := lerp8(rTop, rBot, v)
+					g := lerp8(gTop, gBot, v)
+					bc := lerp8(bTop, bBot, v)
+					a := lerp8(aTop, aBot, v)
+
+					img.SetRGBA(px, py, color.RGBA{r, g, bc, a})
+				}
+			}
+		}
+	}
+	return img
+}
+
+func smoothFlatAreas(src *image.RGBA, blockSize int) *image.RGBA {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+
+	if blockSize <= 1 {
+		return src
+	}
+	if w < 2*blockSize || h < 2*blockSize {
+		return src
+	}
+
+	dst := image.NewRGBA(b)
+	copy(dst.Pix, src.Pix)
+
+	const boundaryLumaThreshold int32 = 10
+
+	for x := b.Min.X + blockSize; x < b.Max.X; x += blockSize {
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			cl := src.RGBAAt(x-1, y)
+			cr := src.RGBAAt(x, y)
+			d := luma(cl) - luma(cr)
+			if d < 0 {
+				d = -d
+			}
+			if d <= boundaryLumaThreshold {
+				r := uint8((uint16(cl.R) + uint16(cr.R)) / 2)
+				g := uint8((uint16(cl.G) + uint16(cr.G)) / 2)
+				bc := uint8((uint16(cl.B) + uint16(cr.B)) / 2)
+				a := uint8((uint16(cl.A) + uint16(cr.A)) / 2)
+				cAvg := color.RGBA{r, g, bc, a}
+				dst.SetRGBA(x-1, y, cAvg)
+				dst.SetRGBA(x, y, cAvg)
+			}
+		}
+	}
+
+	for y := b.Min.Y + blockSize; y < b.Max.Y; y += blockSize {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			ct := src.RGBAAt(x, y-1)
+			cb := src.RGBAAt(x, y)
+			d := luma(ct) - luma(cb)
+			if d < 0 {
+				d = -d
+			}
+			if d <= boundaryLumaThreshold {
+				r := uint8((uint16(ct.R) + uint16(cb.R)) / 2)
+				g := uint8((uint16(ct.G) + uint16(cb.G)) / 2)
+				bc := uint8((uint16(ct.B) + uint16(cb.B)) / 2)
+				a := uint8((uint16(ct.A) + uint16(cb.A)) / 2)
+				cAvg := color.RGBA{r, g, bc, a}
+				dst.SetRGBA(x, y-1, cAvg)
+				dst.SetRGBA(x, y, cAvg)
+			}
+		}
+	}
+	return dst
+}
+
+func smoothBlocks(src *image.RGBA, blockSize int) *image.RGBA {
+	return smoothJunctions(smoothFlatAreas(src, blockSize), blockSize)
 }
 
 func NewBitWriter(buf *bytes.Buffer) *BitWriter {

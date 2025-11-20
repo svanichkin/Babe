@@ -39,6 +39,13 @@ type CompressionPreset struct {
 	MacroBlock int
 }
 
+type blockMeta struct {
+	x, y  int
+	w, h  int
+	fgIdx uint16
+	bgIdx uint16
+}
+
 // CompressionTable maps an integer "quality" to a specific block configuration.
 // Example entries are provided; feel free to change or extend them as needed.
 var CompressionTable = map[int]CompressionPreset{

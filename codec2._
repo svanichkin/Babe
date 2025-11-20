@@ -216,6 +216,55 @@ func rgbKey(c color.RGBA) uint32 {
 }
 
 // простая мапа quality -> параметры.
+// func paramsForQuality(q int) codec2Params {
+// 	if q < 1 {
+// 		q = 1
+// 	}
+// 	if q > 100 {
+// 		q = 100
+// 	}
+// 	qi := float64(100 - q) // 0 (high quality) .. 99 (low quality)
+
+// 	// minBlock: от 2 (высокое качество) до 8 (низкое).
+// 	minB := 1 + math.Round(qi/20.0) // q=100 -> ~2, q=1 -> ~7
+// 	if minB < 1 {
+// 		minB = 1
+// 	}
+// 	if minB > 8 {
+// 		minB = 8
+// 	}
+
+// 	// colorTol: при высоком качестве палитра более точная (малый допуск),
+// 	// при низком качестве можно сливать более далёкие цвета.
+// 	colorTol := 4 + int(qi/20.0) // q=100 -> ~2, q=1 -> ~10
+// 	if colorTol < 4 {
+// 		colorTol = 4
+// 	}
+// 	if colorTol > 14 {
+// 		colorTol = 14
+// 	}
+
+// 	// maxGrad: средняя энергия градиента, при которой блок считается "гладким".
+// 	// Диапазон маленький, т.к. gradEnergy обычно 0..~15 на естественных картинках.
+// 	// При q=100 блоки будут делиться уже при energy > ~3,
+// 	// при q=1 делиться будут только при energy > ~11.
+// 	maxG := 3 + math.Round(qi/12.0) // q=100 -> ~3, q=1 -> ~11
+// 	if maxG < 3 {
+// 		maxG = 3
+// 	}
+// 	if maxG > 16 {
+// 		maxG = 16
+// 	}
+
+// 	fmt.Printf("minB: %.f, maxG: %.f\n", minB, maxG)
+
+// 	return codec2Params{
+// 		minBlock: int(minB),
+// 		maxGrad:  int32(maxG),
+// 		colorTol: colorTol,
+// 	}
+// }
+
 func paramsForQuality(q int) codec2Params {
 	if q < 1 {
 		q = 1
@@ -223,46 +272,20 @@ func paramsForQuality(q int) codec2Params {
 	if q > 100 {
 		q = 100
 	}
-	qi := float64(100 - q) // 0 (high quality) .. 99 (low quality)
 
-	// minBlock: от 2 (высокое качество) до 8 (низкое).
-	minB := 1 + math.Round(qi/20.0) // q=100 -> ~2, q=1 -> ~7
-	if minB < 1 {
-		minB = 1
-	}
-	if minB > 8 {
-		minB = 8
-	}
+	qi := 100 - q
 
-	// colorTol: при высоком качестве палитра более точная (малый допуск),
-	// при низком качестве можно сливать более далёкие цвета.
-	colorTol := 4 + int(qi/20.0) // q=100 -> ~2, q=1 -> ~10
-	if colorTol < 4 {
-		colorTol = 4
+	params := codec2Params{
+		minBlock: 1 + int(float64(qi)*(4.0/100.0)),
+		maxGrad:  int32(ExpMap(qi, 99, 0, 150, 1, -4.0)),
+		colorTol: ExpMap(qi, 99, 0, 7, 1, -3.0),
 	}
-	if colorTol > 14 {
-		colorTol = 14
-	}
-
-	// maxGrad: средняя энергия градиента, при которой блок считается "гладким".
-	// Диапазон маленький, т.к. gradEnergy обычно 0..~15 на естественных картинках.
-	// При q=100 блоки будут делиться уже при energy > ~3,
-	// при q=1 делиться будут только при energy > ~11.
-	maxG := 3 + math.Round(qi/12.0) // q=100 -> ~3, q=1 -> ~11
-	if maxG < 3 {
-		maxG = 3
-	}
-	if maxG > 16 {
-		maxG = 16
-	}
-
-	fmt.Printf("minB: %.f, maxG: %.f\n", minB, maxG)
-
-	return codec2Params{
-		minBlock: int(minB),
-		maxGrad:  int32(maxG),
-		colorTol: colorTol,
-	}
+	fmt.Printf("minBlock=%d, maxGrad=%d, colorTol=%d\n",
+		params.minBlock,
+		params.maxGrad,
+		params.colorTol,
+	)
+	return params
 }
 
 // toRGBA copies any image.Image into an *image.RGBA with bounds starting at (0,0).
@@ -914,3 +937,16 @@ func (br *BitReader) ReadByte() (byte, error) {
 // -----------------------------------------------------------------------------
 
 var ErrInvalidMagic = errors.New("codec2: invalid magic")
+
+// ExpMap преобразует вход x из диапазона [inMin..inMax]
+// в выход [outMin..outMax] по экспоненциальной кривой.
+// k — крутизна (чем больше, тем резче рост в конце).
+func ExpMap(x, inMin, inMax, outMin, outMax int, k float64) int {
+	if inMax == inMin {
+		return outMin
+	}
+
+	t := float64(x-inMin) / float64(inMax-inMin) // корректная нормализация 0..1
+	curved := (math.Exp(k*t) - 1) / (math.Exp(k) - 1)
+	return outMin + int(curved*float64(outMax-outMin))
+}
