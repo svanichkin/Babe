@@ -12,6 +12,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sort"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -95,15 +96,35 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 		if err := binary.Write(&raw, binary.BigEndian, uint16(len(p.colors))); err != nil {
 			return nil, err
 		}
-		for _, c := range p.colors {
-			if err := raw.WriteByte(c.R); err != nil {
-				return nil, err
-			}
-			if err := raw.WriteByte(c.G); err != nil {
-				return nil, err
-			}
-			if err := raw.WriteByte(c.B); err != nil {
-				return nil, err
+		// Дельта-кодирование палитры по ПРЕДЫДУЩЕМУ цвету для уже отсортированных массивов
+		if len(p.colors) > 0 {
+			y0, co0, cg0 := packYCoCg(p.colors[0])
+			if err := raw.WriteByte(y0); err != nil { return nil, err }
+			if err := raw.WriteByte(co0); err != nil { return nil, err }
+			if err := raw.WriteByte(cg0); err != nil { return nil, err }
+
+			prevY := int(y0)
+			prevCo := int(co0)
+			prevCg := int(cg0)
+
+			for j := 1; j < len(p.colors); j++ {
+				y, co, cg := packYCoCg(p.colors[j])
+
+				dy := int(y) - prevY
+				dco := int(co) - prevCo
+				dcg := int(cg) - prevCg
+
+				if dy < -128 { dy = -128 } else if dy > 127 { dy = 127 }
+				if dco < -128 { dco = -128 } else if dco > 127 { dco = 127 }
+				if dcg < -128 { dcg = -128 } else if dcg > 127 { dcg = 127 }
+
+				if err := raw.WriteByte(byte(dy + 128)); err != nil { return nil, err }
+				if err := raw.WriteByte(byte(dco + 128)); err != nil { return nil, err }
+				if err := raw.WriteByte(byte(dcg + 128)); err != nil { return nil, err }
+
+				prevY = int(y)
+				prevCo = int(co)
+				prevCg = int(cg)
 			}
 		}
 	}
@@ -138,6 +159,22 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	treeBytes := treeBuf.Bytes()
 	leafBytes := leafBuf.Bytes()
 	patBytes := patBuf.Bytes()
+
+	// Debug: размеры секций (до zstd)
+	var palettesBytes int
+	for _, p := range pals {
+		palettesBytes += 2 // leafCount
+		palettesBytes += 2 // palSize
+		palettesBytes += len(p.colors) * 3
+	}
+	palettesBytes += 2 // numPalettes
+
+	fmt.Printf("STREAM SIZES (raw, bytes): palettes=%d, leafIndices=%d, patternBits=%d, treeBits=%d\n",
+		palettesBytes,
+		len(leafBytes),
+		len(patBytes),
+		len(treeBytes),
+	)
 
 	if err := binary.Write(&raw, binary.BigEndian, uint32(len(treeBytes))); err != nil {
 		return nil, err
@@ -209,12 +246,42 @@ func Decode(data []byte) (image.Image, error) {
 			return nil, fmt.Errorf("codec2: negative palette size")
 		}
 		p := make([]color.RGBA, sz)
-		for j := 0; j < sz; j++ {
-			var rgb [3]byte
-			if _, err := io.ReadFull(reader, rgb[:]); err != nil {
+		// Дельта-декодирование палитры по ПРЕДЫДУЩЕМУ цвету
+		if sz > 0 {
+			var ycc [3]byte
+			if _, err := io.ReadFull(reader, ycc[:]); err != nil {
 				return nil, err
 			}
-			p[j] = color.RGBA{R: rgb[0], G: rgb[1], B: rgb[2], A: 255}
+			p[0] = unpackYCoCg(ycc[0], ycc[1], ycc[2])
+
+			prevY := int(ycc[0])
+			prevCo := int(ycc[1])
+			prevCg := int(ycc[2])
+
+			for j := 1; j < sz; j++ {
+				var d [3]byte
+				if _, err := io.ReadFull(reader, d[:]); err != nil {
+					return nil, err
+				}
+
+				dy := int(int8(d[0] - 128))
+				dco := int(int8(d[1] - 128))
+				dcg := int(int8(d[2] - 128))
+
+				y := prevY + dy
+				co := prevCo + dco
+				cg := prevCg + dcg
+
+				if y < 0 { y = 0 } else if y > 255 { y = 255 }
+				if co < 0 { co = 0 } else if co > 255 { co = 255 }
+				if cg < 0 { cg = 0 } else if cg > 255 { cg = 255 }
+
+				p[j] = unpackYCoCg(byte(y), byte(co), byte(cg))
+
+				prevY = y
+				prevCo = co
+				prevCg = cg
+			}
 		}
 		palettes[i] = p
 	}
@@ -1035,6 +1102,74 @@ func buildPalettes(leaves []leafColor, pattLeaves []patternLeaf, modes []leafTyp
 	// На всякий случай проверим, что мы прошли все pattern-листы.
 	if pattIdx != len(pattLeaves) {
 		return nil, nil, fmt.Errorf("buildPalettes: used %d pattern leaves, but pattLeaves has %d", pattIdx, len(pattLeaves))
+	}
+
+	// Дополнительный шаг: внутри каждой палитры сортируем цвета по YCoCg,
+	// а индексы во всех ссылках leafRef перенумеровываем согласно новой перестановке.
+	for pid := range pals {
+		colors := pals[pid].colors
+		if len(colors) <= 1 {
+			continue
+		}
+
+		// Подготовим структуру с исходным индексом и координатами YCoCg.
+		type ycColor struct {
+			oldIdx int
+			c      color.RGBA
+			y, co, cg int32
+		}
+		ycs := make([]ycColor, len(colors))
+		for i, c := range colors {
+			y, co, cg := RgbToYCoCg(c)
+			ycs[i] = ycColor{oldIdx: i, c: c, y: y, co: co, cg: cg}
+		}
+
+		// Сортируем по яркости, затем по цветовым компонентам в YCoCg.
+		sort.Slice(ycs, func(i, j int) bool {
+			if ycs[i].y != ycs[j].y {
+				return ycs[i].y < ycs[j].y
+			}
+			if ycs[i].co != ycs[j].co {
+				return ycs[i].co < ycs[j].co
+			}
+			return ycs[i].cg < ycs[j].cg
+		})
+
+		// Строим отображение oldIdx -> newIdx и новую палитру цветов.
+		inv := make([]int, len(colors))
+		newColors := make([]color.RGBA, len(colors))
+		for newIdx, yc := range ycs {
+			newColors[newIdx] = yc.c
+			inv[yc.oldIdx] = newIdx
+		}
+		pals[pid].colors = newColors
+
+		// Обновляем индексы во всех ссылках leafRef, которые ссылаются на эту палитру.
+		for i := range refs {
+			if int(refs[i].pal) != pid {
+				continue
+			}
+			switch refs[i].typ {
+			case leafTypeSolid:
+				old := int(refs[i].idx)
+				if old < 0 || old >= len(inv) {
+					return nil, nil, fmt.Errorf("buildPalettes: solid index %d out of range for palette %d", old, pid)
+				}
+				refs[i].idx = uint8(inv[old])
+			case leafTypePattern:
+				oldFg := int(refs[i].fg)
+				oldBg := int(refs[i].bg)
+				if oldFg < 0 || oldFg >= len(inv) || oldBg < 0 || oldBg >= len(inv) {
+					return nil, nil, fmt.Errorf("buildPalettes: pattern indices (%d,%d) out of range for palette %d", oldFg, oldBg, pid)
+				}
+				newFg := inv[oldFg]
+				newBg := inv[oldBg]
+				refs[i].fg = uint8(newFg)
+				refs[i].bg = uint8(newBg)
+				// idx хранит "основной" цвет листа — обновляем его так же, как fg.
+				refs[i].idx = uint8(newFg)
+			}
+		}
 	}
 
 	return pals, refs, nil
@@ -1961,4 +2096,82 @@ func Abs32(v int32) int32 {
 		return -v
 	}
 	return v
+}
+
+// YCoCgToRgb converts integer YCoCg components back to an RGBA color.
+// Это обратное преобразование к RgbToYCoCg, с простым целочисленным округлением
+// и последующим клэмпом в диапазон 0..255.
+func YCoCgToRgb(y, co, cg int32) color.RGBA {
+	// tmp = b + co/2
+	// cg = g - tmp
+	// y = tmp + cg/2
+	// => tmp = y - cg/2
+	tmp := y - cg/2
+	g := tmp + cg
+	b := tmp - co/2
+	r := co + b
+
+	if r < 0 {
+		r = 0
+	} else if r > 255 {
+		r = 255
+	}
+	if g < 0 {
+		g = 0
+	} else if g > 255 {
+		g = 255
+	}
+	if b < 0 {
+		b = 0
+	} else if b > 255 {
+		b = 255
+	}
+	return color.RGBA{uint8(r), uint8(g), uint8(b), 255}
+}
+
+// packYCoCg quantizes YCoCg into 3 bytes for storage:
+//   - Y пишем как есть (0..255),
+//   - Co/Cg сначала сжимаем по амплитуде (делим на 2), затем смещаем в 0..255.
+//
+// Это немного теряет точность по цвету, но хорошо жмётся и остаётся стабильным.
+func packYCoCg(c color.RGBA) (byte, byte, byte) {
+	y, co, cg := RgbToYCoCg(c)
+
+	if y < 0 {
+		y = 0
+	} else if y > 255 {
+		y = 255
+	}
+
+	// Сжимаем Co/Cg по амплитуде, чтобы уложиться в int8, и центрируем в 128.
+	co >>= 1
+	cg >>= 1
+	if co < -128 {
+		co = -128
+	} else if co > 127 {
+		co = 127
+	}
+	if cg < -128 {
+		cg = -128
+	} else if cg > 127 {
+		cg = 127
+	}
+
+	// Приводим к uint8 через промежуточный более широкий тип, чтобы избежать
+	// переполнения константы 128 при приведении к int8.
+	coByte := byte(int16(int8(co)) + 128)
+	cgByte := byte(int16(int8(cg)) + 128)
+
+	return byte(y), coByte, cgByte
+}
+
+// unpackYCoCg выполняет обратное преобразование:
+//   - читает Y, Co, Cg из 3 байт,
+//   - восстанавливает приблизительные Co/Cg,
+//   - конвертирует в RGB.
+func unpackYCoCg(yb, cob, cgb byte) color.RGBA {
+	y := int32(yb)
+	co := int32(int8(cob-128)) << 1
+	cg := int32(int8(cgb-128)) << 1
+	return YCoCgToRgb(y, co, cg)
 }

@@ -53,7 +53,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "encode error:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Encoded %s (quality=%d) → %s\n", inputPath, quality, outPath)
+	info, err := os.Stat(outPath)
+	if err != nil {
+		fmt.Printf("Encoded %s (quality=%d) → %s\n", inputPath, quality, outPath)
+	} else {
+		size := info.Size()
+		var sizeStr string
+		if size < 1_000_000 {
+			sizeStr = fmt.Sprintf("%.2f KB", float64(size)/1024)
+		} else {
+			sizeStr = fmt.Sprintf("%.2f MB", float64(size)/1024/1024)
+		}
+		fmt.Printf("Encoded %s (quality=%d, size=%s) → %s\n",
+			inputPath, quality, sizeStr, outPath)
+	}
 }
 
 func encodeToBabe(inPath, outPath string, quality int) error {

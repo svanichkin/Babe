@@ -7,6 +7,12 @@
 *.dll
 *.so
 *.dylib
+*.jpg
+*.png
+*.babe
+*.jpeg
+*._
+*.rsls
 
 # Test binary, built with `go test -c`
 *.test
