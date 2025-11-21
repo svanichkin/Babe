@@ -916,7 +916,7 @@ func collectRegionColorsStriped(
 }
 
 // computeFG_BG вычисляет два усреднённых цвета (fg/bg) для блока,
-// разделяя пиксели по порогу яркости thr.
+// разделяя пиксели по порогу яркости thr с помощью итеративного порога.
 func computeFG_BG(img *image.YCbCr, luma []int16, x, y, w, h int) (fg, bg color.YCbCr, thr int32, ok bool) {
 	b := img.Bounds()
 	wImg := b.Dx()
@@ -924,63 +924,101 @@ func computeFG_BG(img *image.YCbCr, luma []int16, x, y, w, h int) (fg, bg color.
 	minX := b.Min.X
 	minY := b.Min.Y
 
-	var sumL int64
-	var count int64
+	// Собираем все пиксели блока в локальный срез для повторного использования в итерациях.
+	type blockPixel struct {
+		l        int32
+		Y, Cb, Cr uint8
+	}
+
+	pixels := make([]blockPixel, 0, w*h)
+
 	for yy := 0; yy < h; yy++ {
 		py := y + yy
 		if py < b.Min.Y || py >= b.Max.Y {
 			continue
 		}
+		rowL := (py - minY) * wImg
+		rowY := (py - minY) * img.YStride
 		for xx := 0; xx < w; xx++ {
 			px := x + xx
 			if px < b.Min.X || px >= b.Max.X {
 				continue
 			}
-			idx := (py-minY)*wImg + (px - minX)
-			sumL += int64(luma[idx])
-			count++
+			li := rowL + (px - minX)
+			yi := rowY + (px - minX)
+			pixels = append(pixels, blockPixel{
+				l:  int32(luma[li]),
+				Y:  img.Y[yi],
+				Cb: img.Cb[yi],
+				Cr: img.Cr[yi],
+			})
 		}
 	}
-	if count == 0 {
+
+	if len(pixels) == 0 {
 		return color.YCbCr{Y: 0, Cb: 0, Cr: 0}, color.YCbCr{Y: 0, Cb: 0, Cr: 0}, 0, false
 	}
-	thr = int32(sumL / count)
 
-	var fgY, fgCb, fgCr, bgY, bgCb, bgCr int64
-	var fgCount, bgCount int64
+	// Начальный порог: среднее значение яркости по блоку.
+	var sumL int64
+	for _, p := range pixels {
+		sumL += int64(p.l)
+	}
+	thr = int32(sumL / int64(len(pixels)))
 
-	for yy := 0; yy < h; yy++ {
-		py := y + yy
-		if py < b.Min.Y || py >= b.Max.Y {
-			continue
-		}
-		for xx := 0; xx < w; xx++ {
-			px := x + xx
-			if px < b.Min.X || px >= b.Max.X {
-				continue
-			}
-			idx := (py-minY)*wImg + (px - minX)
-			l := int32(luma[idx])
+	const maxIter = 4
 
-			yIdx := (py-minY)*img.YStride + (px - minX)
-			Y := img.Y[yIdx]
-			Cb := img.Cb[yIdx]
-			Cr := img.Cr[yIdx]
+	var (
+		fgY, fgCb, fgCr int64
+		bgY, bgCb, bgCr int64
+		fgCount, bgCount int64
+	)
 
-			if l >= thr {
-				fgY += int64(Y)
-				fgCb += int64(Cb)
-				fgCr += int64(Cr)
+	for iter := 0; iter < maxIter; iter++ {
+		fgY, fgCb, fgCr = 0, 0, 0
+		bgY, bgCb, bgCr = 0, 0, 0
+		fgCount, bgCount = 0, 0
+
+		var sumLf, sumLb int64
+
+		for _, p := range pixels {
+			if p.l >= thr {
 				fgCount++
+				sumLf += int64(p.l)
+				fgY += int64(p.Y)
+				fgCb += int64(p.Cb)
+				fgCr += int64(p.Cr)
 			} else {
-				bgY += int64(Y)
-				bgCb += int64(Cb)
-				bgCr += int64(Cr)
 				bgCount++
+				sumLb += int64(p.l)
+				bgY += int64(p.Y)
+				bgCb += int64(p.Cb)
+				bgCr += int64(p.Cr)
 			}
 		}
+
+		// Дегенеративное разбиение — больше делить некуда.
+		if fgCount == 0 || bgCount == 0 {
+			break
+		}
+
+		// Классический итеративный порог: новый = (mean_fg + mean_bg) / 2.
+		meanFg := sumLf / fgCount
+		meanBg := sumLb / bgCount
+		newThr := int32((meanFg + meanBg) / 2)
+
+		// Останавливаемся, если сошлось.
+		if Abs32(newThr-thr) <= 0 {
+			thr = newThr
+			break
+		}
+		thr = newThr
 	}
 
+	// Избегаем деления на ноль; если обе стороны пусты — невалидный блок.
+	if fgCount == 0 && bgCount == 0 {
+		return color.YCbCr{Y: 0, Cb: 0, Cr: 0}, color.YCbCr{Y: 0, Cb: 0, Cr: 0}, thr, false
+	}
 	if fgCount == 0 {
 		fgCount = 1
 	}
