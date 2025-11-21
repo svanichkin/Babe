@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
 	"io"
 	"math"
 	"runtime"
@@ -52,12 +51,12 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	quality = ValidateQuality(quality)
 	params := paramsForQuality(quality)
 
-	// Ensure RGBA for fast access.
-	rgba := ImageToRGBA(img)
-	luma := buildLumaBuffer(rgba)
+	// Конвертируем исходник один раз в full-res YCbCr 4:4:4 и дальше работаем в этом пространстве.
+	yimg := ImageToYCbCr(img)
+	luma := buildLumaBuffer(yimg)
 
-	w := uint16(rgba.Bounds().Dx())
-	h := uint16(rgba.Bounds().Dy())
+	w := uint16(yimg.Bounds().Dx())
+	h := uint16(yimg.Bounds().Dy())
 
 	b := &bytes.Buffer{}
 
@@ -75,7 +74,7 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	}
 
 	// 1) Первый проход: параллельно собираем цвета для всех листьев и форму дерева по вертикальным полосам.
-	leaves, pattLeaves, leafModes, pattern, stats, err := collectRegionColorsStriped(rgba, luma, params, stripesHint)
+	leaves, pattLeaves, leafModes, pattern, stats, err := collectRegionColorsStriped(yimg, luma, params, stripesHint)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +197,7 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	stripes := splitStripes(int(w), int(h), params.minBlock, stripesHint)
 	for _, s := range stripes {
 		if err := encodeRegion(
-			rgba, luma, s.x, s.y, s.w, s.h,
+			yimg, luma, s.x, s.y, s.w, s.h,
 			params, bwTree, refs, &leafPos, pattern, &patPos, &leafBuf, bwPat,
 		); err != nil {
 			return nil, err
@@ -748,7 +747,7 @@ func ExpMap(x, inMin, inMax, outMin, outMax int, k float64) int {
 }
 
 // analyzeBlock computes the total, border, and inner energy (luma spread) and average color in a single scan.
-func analyzeBlock(img *image.RGBA, luma []int16, x, y, w, h int) (totalEnergy int32, borderEnergy int32, innerEnergy int32, avg color.RGBA) {
+func analyzeBlock(img *image.YCbCr, luma []int16, x, y, w, h int) (totalEnergy int32, borderEnergy int32, innerEnergy int32, avg color.RGBA) {
 	b := img.Bounds()
 	wImg := b.Dx()
 
@@ -762,11 +761,9 @@ func analyzeBlock(img *image.RGBA, luma []int16, x, y, w, h int) (totalEnergy in
 
 	var haveBorder, haveInner bool
 
-	var sumR, sumG, sumB int64
+	var sumY, sumCb, sumCr int64
 	var count int64
 
-	pix := img.Pix
-	stride := img.Stride
 	minX := b.Min.X
 	minY := b.Min.Y
 
@@ -775,21 +772,14 @@ func analyzeBlock(img *image.RGBA, luma []int16, x, y, w, h int) (totalEnergy in
 		if py < b.Min.Y || py >= b.Max.Y {
 			continue
 		}
-		rowOff := (py - minY) * stride
 		for xx := 0; xx < w; xx++ {
 			px := x + xx
 			if px < b.Min.X || px >= b.Max.X {
 				continue
 			}
-			off := rowOff + (px-minX)*4
-			r := pix[off+0]
-			g := pix[off+1]
-			bc := pix[off+2]
-			a := pix[off+3]
 			idx := (py-minY)*wImg + (px - minX)
 			l := int32(luma[idx])
 
-			// Общая энергия по блоку.
 			if l < minL {
 				minL = l
 			}
@@ -797,7 +787,6 @@ func analyzeBlock(img *image.RGBA, luma []int16, x, y, w, h int) (totalEnergy in
 				maxL = l
 			}
 
-			// Проверяем, принадлежит ли пиксель границе блока.
 			isBorder := xx == 0 || yy == 0 || xx == w-1 || yy == h-1
 			if isBorder {
 				if l < minLBorder {
@@ -817,12 +806,11 @@ func analyzeBlock(img *image.RGBA, luma []int16, x, y, w, h int) (totalEnergy in
 				haveInner = true
 			}
 
-			sumR += int64(r)
-			sumG += int64(g)
-			sumB += int64(bc)
+			yIdx := (py-minY)*img.YStride + (px - minX)
+			sumY += int64(img.Y[yIdx])
+			sumCb += int64(img.Cb[yIdx])
+			sumCr += int64(img.Cr[yIdx])
 			count++
-
-			_ = a // alpha не участвует в яркости/среднем цвете
 		}
 	}
 
@@ -838,19 +826,19 @@ func analyzeBlock(img *image.RGBA, luma []int16, x, y, w, h int) (totalEnergy in
 		innerEnergy = maxLInner - minLInner
 	}
 
-	avg = color.RGBA{
-		R: uint8(sumR / count),
-		G: uint8(sumG / count),
-		B: uint8(sumB / count),
-		A: 255,
-	}
+	avgY := uint8(sumY / count)
+	avgCb := uint8(sumCb / count)
+	avgCr := uint8(sumCr / count)
+	avgYC := color.YCbCr{Y: avgY, Cb: avgCb, Cr: avgCr}
+	avg = color.RGBAModel.Convert(avgYC).(color.RGBA)
+	avg.A = 255
 	return totalEnergy, borderEnergy, innerEnergy, avg
 }
 
 // collectRegionColorsStriped запускает collectRegionColors независимо для нескольких вертикальных полос
 // и склеивает результат. Каждая полоса использует свою локальную форму дерева (pattern) и цвета листьев.
 func collectRegionColorsStriped(
-	img *image.RGBA,
+	img *image.YCbCr,
 	luma []int16,
 	params codec2Params,
 	maxStripes int,
@@ -967,12 +955,10 @@ func collectRegionColorsStriped(
 
 // computeFG_BG вычисляет два усреднённых цвета (fg/bg) для блока,
 // разделяя пиксели по порогу яркости thr.
-func computeFG_BG(img *image.RGBA, luma []int16, x, y, w, h int) (fg, bg color.RGBA, thr int32, ok bool) {
+func computeFG_BG(img *image.YCbCr, luma []int16, x, y, w, h int) (fg, bg color.RGBA, thr int32, ok bool) {
 	b := img.Bounds()
 	wImg := b.Dx()
 
-	pix := img.Pix
-	stride := img.Stride
 	minX := b.Min.X
 	minY := b.Min.Y
 
@@ -998,7 +984,7 @@ func computeFG_BG(img *image.RGBA, luma []int16, x, y, w, h int) (fg, bg color.R
 	}
 	thr = int32(sumL / count)
 
-	var fgR, fgG, fgB, bgR, bgG, bgB int64
+	var fgY, fgCb, fgCr, bgY, bgCb, bgCr int64
 	var fgCount, bgCount int64
 
 	for yy := 0; yy < h; yy++ {
@@ -1006,27 +992,28 @@ func computeFG_BG(img *image.RGBA, luma []int16, x, y, w, h int) (fg, bg color.R
 		if py < b.Min.Y || py >= b.Max.Y {
 			continue
 		}
-		rowOff := (py - minY) * stride
 		for xx := 0; xx < w; xx++ {
 			px := x + xx
 			if px < b.Min.X || px >= b.Max.X {
 				continue
 			}
-			off := rowOff + (px-minX)*4
-			r := pix[off+0]
-			g := pix[off+1]
-			bc := pix[off+2]
 			idx := (py-minY)*wImg + (px - minX)
 			l := int32(luma[idx])
+
+			yIdx := (py-minY)*img.YStride + (px - minX)
+			Y := img.Y[yIdx]
+			Cb := img.Cb[yIdx]
+			Cr := img.Cr[yIdx]
+
 			if l >= thr {
-				fgR += int64(r)
-				fgG += int64(g)
-				fgB += int64(bc)
+				fgY += int64(Y)
+				fgCb += int64(Cb)
+				fgCr += int64(Cr)
 				fgCount++
 			} else {
-				bgR += int64(r)
-				bgG += int64(g)
-				bgB += int64(bc)
+				bgY += int64(Y)
+				bgCb += int64(Cb)
+				bgCr += int64(Cr)
 				bgCount++
 			}
 		}
@@ -1039,23 +1026,25 @@ func computeFG_BG(img *image.RGBA, luma []int16, x, y, w, h int) (fg, bg color.R
 		bgCount = 1
 	}
 
-	fg = color.RGBA{
-		R: uint8(fgR / fgCount),
-		G: uint8(fgG / fgCount),
-		B: uint8(fgB / fgCount),
-		A: 255,
+	fgYC := color.YCbCr{
+		Y:  uint8(fgY / fgCount),
+		Cb: uint8(fgCb / fgCount),
+		Cr: uint8(fgCr / fgCount),
 	}
-	bg = color.RGBA{
-		R: uint8(bgR / bgCount),
-		G: uint8(bgG / bgCount),
-		B: uint8(bgB / bgCount),
-		A: 255,
+	bgYC := color.YCbCr{
+		Y:  uint8(bgY / bgCount),
+		Cb: uint8(bgCb / bgCount),
+		Cr: uint8(bgCr / bgCount),
 	}
+	fg = color.RGBAModel.Convert(fgYC).(color.RGBA)
+	bg = color.RGBAModel.Convert(bgYC).(color.RGBA)
+	fg.A = 255
+	bg.A = 255
 	return fg, bg, thr, true
 }
 
 func pickLeafModel(
-	img *image.RGBA,
+	img *image.YCbCr,
 	luma []int16,
 	x, y, w, h int,
 	avg color.RGBA,
@@ -1157,7 +1146,7 @@ func pickLeafModel(
 }
 
 func collectRegionColors(
-	img *image.RGBA,
+	img *image.YCbCr,
 	luma []int16,
 	x, y, w, h int,
 	params codec2Params,
@@ -1488,7 +1477,7 @@ func buildPalettes(leaves []leafColor, pattLeaves []patternLeaf, modes []leafTyp
 // encodeRegion рекурсивно кодирует прямоугольник (x,y,w,h) по заранее вычисленному дереву (pattern).
 // pattern: []bool, где каждый бит указывает, является ли данный узел листом (true) или внутренним (false).
 func encodeRegion(
-	img *image.RGBA,
+	img *image.YCbCr,
 	luma []int16,
 	x, y, w, h int,
 	params codec2Params,
@@ -1806,17 +1795,27 @@ func ValidateQuality(q int) int {
 	return q
 }
 
-// ImageToRGBA copies any image.Image into an *image.RGBA with bounds starting at (0,0).
-func ImageToRGBA(src image.Image) *image.RGBA {
+// ImageToYCbCr copies any image.Image into an *image.YCbCr (4:4:4) with bounds starting at (0,0).
+func ImageToYCbCr(src image.Image) *image.YCbCr {
 	b := src.Bounds()
-	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
+	rect := image.Rect(0, 0, b.Dx(), b.Dy())
+	dst := image.NewYCbCr(rect, image.YCbCrSubsampleRatio444)
+
+	for y := 0; y < rect.Dy(); y++ {
+		for x := 0; x < rect.Dx(); x++ {
+			c := color.YCbCrModel.Convert(src.At(b.Min.X+x, b.Min.Y+y)).(color.YCbCr)
+			i := y*dst.YStride + x
+			dst.Y[i] = c.Y
+			dst.Cb[i] = c.Cb
+			dst.Cr[i] = c.Cr
+		}
+	}
 	return dst
 }
 
 // buildLumaBuffer computes luma (0..255) for each pixel of an RGBA image
 // and returns a flat slice indexed as (y - minY)*width + (x - minX).
-func buildLumaBuffer(img *image.RGBA) []int16 {
+func buildLumaBuffer(img *image.YCbCr) []int16 {
 	b := img.Bounds()
 	w := b.Dx()
 	h := b.Dy()
@@ -1826,21 +1825,15 @@ func buildLumaBuffer(img *image.RGBA) []int16 {
 
 	buf := make([]int16, w*h)
 
-	pix := img.Pix
-	stride := img.Stride
 	minX := b.Min.X
 	minY := b.Min.Y
 
 	for yy := b.Min.Y; yy < b.Max.Y; yy++ {
-		rowOff := (yy - minY) * stride
 		rowIdx := (yy - minY) * w
 		for xx := b.Min.X; xx < b.Max.X; xx++ {
-			off := rowOff + (xx-minX)*4
-			r := pix[off+0]
-			g := pix[off+1]
-			bc := pix[off+2]
-			l := lumaFromRGB(r, g, bc)
-			buf[rowIdx+(xx-minX)] = int16(l)
+			yIdx := (yy-minY)*img.YStride + (xx - minX)
+			Y := img.Y[yIdx]
+			buf[rowIdx+(xx-minX)] = int16(Y)
 		}
 	}
 
@@ -2433,18 +2426,16 @@ func lumaFromRGB(r, g, b uint8) int32 {
 	return (299*int32(r) + 587*int32(g) + 114*int32(b) + 500) / 1000
 }
 
-// RgbToYCoCg converts an RGBA color into integer YCoCg components.
-// This is a reversible transform in theory; здесь нам важны только относительные расстояния.
+// RgbToYCoCg теперь использует стандартное YCbCr из стандартной библиотеки.
+// Y: 0..255, Co/Cg здесь храним как отклонение Cb/Cr от 128.
 func RgbToYCoCg(c color.RGBA) (y, co, cg int32) {
-	r := int32(c.R)
-	g := int32(c.G)
-	b := int32(c.B)
-
-	co = r - b
-	tmp := b + co/2
-	cg = g - tmp
-	y = tmp + cg/2
-	return y, co, cg
+	// Интерпретируем как стандартное YCbCr из стандартной библиотеки.
+	// Y: 0..255, Co/Cg здесь храним как отклонение Cb/Cr от 128.
+	yc := color.YCbCrModel.Convert(c).(color.YCbCr)
+	y = int32(yc.Y)
+	co = int32(int8(yc.Cb - 128)) // signed chroma (Cb)
+	cg = int32(int8(yc.Cr - 128)) // signed chroma (Cr)
+	return
 }
 
 func Abs32(v int32) int32 {
@@ -2454,80 +2445,19 @@ func Abs32(v int32) int32 {
 	return v
 }
 
-// YCoCgToRgb converts integer YCoCg components back to an RGBA color.
-// Это обратное преобразование к RgbToYCoCg, с простым целочисленным округлением
-// и последующим клэмпом в диапазон 0..255.
-func YCoCgToRgb(y, co, cg int32) color.RGBA {
-	// tmp = b + co/2
-	// cg = g - tmp
-	// y = tmp + cg/2
-	// => tmp = y - cg/2
-	tmp := y - cg/2
-	g := tmp + cg
-	b := tmp - co/2
-	r := co + b
-
-	if r < 0 {
-		r = 0
-	} else if r > 255 {
-		r = 255
-	}
-	if g < 0 {
-		g = 0
-	} else if g > 255 {
-		g = 255
-	}
-	if b < 0 {
-		b = 0
-	} else if b > 255 {
-		b = 255
-	}
-	return color.RGBA{uint8(r), uint8(g), uint8(b), 255}
-}
-
-// packYCoCg quantizes YCoCg into 3 bytes for storage:
-//   - Y пишем как есть (0..255),
-//   - Co/Cg сначала сжимаем по амплитуде (делим на 2), затем смещаем в 0..255.
+// packYCoCg now фактически упаковывает цвет в стандартное YCbCr:
+//   - Y (0..255)
+//   - Cb/Cb (0..255)
 //
-// Это немного теряет точность по цвету, но хорошо жмётся и остаётся стабильным.
+// Дальше палитра дельта-кодируется по тем же правилам, что и раньше.
 func packYCoCg(c color.RGBA) (byte, byte, byte) {
-	y, co, cg := RgbToYCoCg(c)
-
-	if y < 0 {
-		y = 0
-	} else if y > 255 {
-		y = 255
-	}
-
-	// Сжимаем Co/Cg по амплитуде, чтобы уложиться в int8, и центрируем в 128.
-	co >>= 1
-	cg >>= 1
-	if co < -128 {
-		co = -128
-	} else if co > 127 {
-		co = 127
-	}
-	if cg < -128 {
-		cg = -128
-	} else if cg > 127 {
-		cg = 127
-	}
-
-	// Приводим к uint8 через промежуточный более широкий тип, чтобы избежать
-	// переполнения константы 128 при приведении к int8.
-	coByte := byte(int16(int8(co)) + 128)
-	cgByte := byte(int16(int8(cg)) + 128)
-
-	return byte(y), coByte, cgByte
+	yc := color.YCbCrModel.Convert(c).(color.YCbCr)
+	return yc.Y, yc.Cb, yc.Cr
 }
 
-// unpackYCoCg выполняет обратное преобразование:
-//   - читает Y, Co, Cg из 3 байт,
-//   - восстанавливает приблизительные Co/Cg,
-//   - конвертирует в RGB.
-func unpackYCoCg(yb, cob, cgb byte) color.RGBA {
-	y := int32(yb)
-	co := int32(int8(cob-128)) << 1
-	cg := int32(int8(cgb-128)) << 1
-	return YCoCgToRgb(y, co, cg)
+// unpackYCoCg выполняет обратное преобразование из YCbCr в RGBA
+// с использованием стандартных преобразований из пакета image/color.
+func unpackYCoCg(yb, cb, crb byte) color.RGBA {
+	yc := color.YCbCr{Y: yb, Cb: cb, Cr: crb}
+	return color.RGBAModel.Convert(yc).(color.RGBA)
 }
