@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 	"image"
-	"image/png"
-	_ "image/jpeg"
 	_ "image/gif"
+	_ "image/jpeg"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"

@@ -612,6 +612,60 @@ type stripeInfo struct {
 	w, h int
 }
 
+// nodeSplit описывает разбиение блока на две части.
+type nodeSplit struct {
+	x1, y1, w1, h1 int
+	x2, y2, w2, h2 int
+}
+
+// splitNode делит блок (x,y,w,h) на две части.
+// preferHorizontal определяет, какую ось пробовать первой:
+//   - true: сначала делим по ширине, потом по высоте (если нельзя по ширине);
+//   - false: сначала по высоте, потом по ширине.
+func splitNode(x, y, w, h int, preferHorizontal bool) (nodeSplit, bool) {
+	if w <= 1 && h <= 1 {
+		return nodeSplit{}, false
+	}
+
+	if preferHorizontal {
+		if w > 1 {
+			w1 := w / 2
+			w2 := w - w1
+			return nodeSplit{
+				x1: x, y1: y, w1: w1, h1: h,
+				x2: x + w1, y2: y, w2: w2, h2: h,
+			}, true
+		}
+		if h > 1 {
+			h1 := h / 2
+			h2 := h - h1
+			return nodeSplit{
+				x1: x, y1: y, w1: w, h1: h1,
+				x2: x, y2: y + h1, w2: w, h2: h2,
+			}, true
+		}
+	} else {
+		if h > 1 {
+			h1 := h / 2
+			h2 := h - h1
+			return nodeSplit{
+				x1: x, y1: y, w1: w, h1: h1,
+				x2: x, y2: y + h1, w2: w, h2: h2,
+			}, true
+		}
+		if w > 1 {
+			w1 := w / 2
+			w2 := w - w1
+			return nodeSplit{
+				x1: x, y1: y, w1: w1, h1: h,
+				x2: x + w1, y2: y, w2: w2, h2: h,
+			}, true
+		}
+	}
+
+	return nodeSplit{}, false
+}
+
 // splitStripes разбивает изображение на не более чем maxStripes полос
 // вдоль более длинной стороны: для "высокого" кадра полосы идут по высоте,
 // для "широкого" — по ширине. Каждая полоса описывается прямоугольником.
@@ -732,7 +786,7 @@ func analyzeBlock(img *image.RGBA, luma []int16, x, y, w, h int) (totalEnergy in
 			g := pix[off+1]
 			bc := pix[off+2]
 			a := pix[off+3]
-			idx := (py-minY)*wImg + (px-minX)
+			idx := (py-minY)*wImg + (px - minX)
 			l := int32(luma[idx])
 
 			// Общая энергия по блоку.
@@ -934,7 +988,7 @@ func computeFG_BG(img *image.RGBA, luma []int16, x, y, w, h int) (fg, bg color.R
 			if px < b.Min.X || px >= b.Max.X {
 				continue
 			}
-			idx := (py-minY)*wImg + (px-minX)
+			idx := (py-minY)*wImg + (px - minX)
 			sumL += int64(luma[idx])
 			count++
 		}
@@ -962,7 +1016,7 @@ func computeFG_BG(img *image.RGBA, luma []int16, x, y, w, h int) (fg, bg color.R
 			r := pix[off+0]
 			g := pix[off+1]
 			bc := pix[off+2]
-			idx := (py-minY)*wImg + (px-minX)
+			idx := (py-minY)*wImg + (px - minX)
 			l := int32(luma[idx])
 			if l >= thr {
 				fgR += int64(r)
@@ -1028,7 +1082,7 @@ func pickLeafModel(
 			if px < b.Min.X || px >= b.Max.X {
 				continue
 			}
-			idx := (py-minY)*wImg + (px-minX)
+			idx := (py-minY)*wImg + (px - minX)
 			l := int32(luma[idx])
 			dl := l - avgL
 			if dl < 0 {
@@ -1062,7 +1116,7 @@ func pickLeafModel(
 			if px < b.Min.X || px >= b.Max.X {
 				continue
 			}
-			idx := (py-minY)*wImg + (px-minX)
+			idx := (py-minY)*wImg + (px - minX)
 			l := int32(luma[idx])
 			var aproxL int32
 			if l >= thr {
@@ -1126,29 +1180,18 @@ func collectRegionColors(
 		if energy > params.maxGrad && (w > 1 || h > 1) {
 			*pattern = append(*pattern, false) // внутренний узел
 
-			if w >= h && w > 1 {
-				w1 := w / 2
-				w2 := w - w1
-				if err := collectRegionColors(img, luma, x, y, w1, h, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
-					return err
-				}
-				if err := collectRegionColors(img, luma, x+w1, y, w2, h, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
-					return err
-				}
-				return nil
+			sp, ok := splitNode(x, y, w, h, w >= h)
+			if !ok {
+				return fmt.Errorf("collectRegionColors: internal node with non-divisible geometry (%d×%d)", w, h)
 			}
 
-			if h > 1 {
-				h1 := h / 2
-				h2 := h - h1
-				if err := collectRegionColors(img, luma, x, y, w, h1, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
-					return err
-				}
-				if err := collectRegionColors(img, luma, x, y+h1, w, h2, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
-					return err
-				}
-				return nil
+			if err := collectRegionColors(img, luma, sp.x1, sp.y1, sp.w1, sp.h1, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+				return err
 			}
+			if err := collectRegionColors(img, luma, sp.x2, sp.y2, sp.w2, sp.h2, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+				return err
+			}
+			return nil
 		}
 
 		// иначе — обычный лист
@@ -1205,21 +1248,23 @@ func collectRegionColors(
 		// Внутренний узел: делим по ширине.
 		*pattern = append(*pattern, false)
 
-		w1 := w / 2
-		w2 := w - w1
-		if err := collectRegionColors(img, luma, x, y, w1, h, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+		sp, ok := splitNode(x, y, w, h, true)
+		if !ok {
+			return fmt.Errorf("collectRegionColors: internal node with non-divisible geometry (%d×%d)", w, h)
+		}
+
+		if err := collectRegionColors(img, luma, sp.x1, sp.y1, sp.w1, sp.h1, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
 			return err
 		}
-		if err := collectRegionColors(img, luma, x+w1, y, w2, h, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+		if err := collectRegionColors(img, luma, sp.x2, sp.y2, sp.w2, sp.h2, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
 			return err
 		}
 		return nil
 	}
 
 	// Пробуем делить по высоте.
-	h1 := h / 2
-	h2 := h - h1
-	if h1 < params.minBlock {
+	sp, ok := splitNode(x, y, w, h, false)
+	if !ok || sp.h1 < params.minBlock {
 		// Слишком маленький для деления блок — принудительно лист.
 		*pattern = append(*pattern, true)
 		_, _, _, avg := analyzeBlock(img, luma, x, y, w, h)
@@ -1234,10 +1279,10 @@ func collectRegionColors(
 
 	// Внутренний узел: делим по высоте.
 	*pattern = append(*pattern, false)
-	if err := collectRegionColors(img, luma, x, y, w, h1, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+	if err := collectRegionColors(img, luma, sp.x1, sp.y1, sp.w1, sp.h1, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
 		return err
 	}
-	if err := collectRegionColors(img, luma, x, y+h1, w, h2, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
+	if err := collectRegionColors(img, luma, sp.x2, sp.y2, sp.w2, sp.h2, params, leaves, pattLeaves, modes, pattern, stats); err != nil {
 		return err
 	}
 
@@ -1520,7 +1565,7 @@ func encodeRegion(
 						}
 						continue
 					}
-					idx := (py-minY)*wImg + (px-minX)
+					idx := (py-minY)*wImg + (px - minX)
 					l := int32(luma[idx])
 					if l >= thr {
 						if err := patBW.WriteBit(true); err != nil {
@@ -1545,38 +1590,20 @@ func encodeRegion(
 		return err
 	}
 
-	// Делим только по геометрии, без minBlock: это должно совпадать с веткой
-	// "усиленного деления" в collectRegionColors, где мы делим даже при размере
-	// меньше minBlock, пока w > 1 или h > 1.
-	if w >= h && w > 1 {
-		// Делим по ширине.
-		w1 := w / 2
-		w2 := w - w1
-		if err := encodeRegion(img, luma, x, y, w1, h, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
-			return err
-		}
-		if err := encodeRegion(img, luma, x+w1, y, w2, h, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
-			return err
-		}
-		return nil
+	sp, ok := splitNode(x, y, w, h, w >= h)
+	if !ok {
+		// Если сюда попали, значит pattern пометил внутренний узел для блока,
+		// который уже нельзя делить геометрически — это логическая ошибка.
+		return fmt.Errorf("encodeRegion: internal node with non-divisible geometry (%d×%d)", w, h)
 	}
 
-	// Иначе делим по высоте (если можем).
-	if h > 1 {
-		h1 := h / 2
-		h2 := h - h1
-		if err := encodeRegion(img, luma, x, y, w, h1, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
-			return err
-		}
-		if err := encodeRegion(img, luma, x, y+h1, w, h2, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
-			return err
-		}
-		return nil
+	if err := encodeRegion(img, luma, sp.x1, sp.y1, sp.w1, sp.h1, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
+		return err
 	}
-
-	// Если сюда попали, значит pattern пометил внутренний узел для блока,
-	// который уже нельзя делить геометрически — это логическая ошибка.
-	return fmt.Errorf("encodeRegion: internal node with non-divisible geometry (%d×%d)", w, h)
+	if err := encodeRegion(img, luma, sp.x2, sp.y2, sp.w2, sp.h2, params, bw, refs, leafPos, pattern, patPos, leafBuf, patBW); err != nil {
+		return err
+	}
+	return nil
 }
 
 // decodeRegionJobs зеркален decodeRegion, но вместо отрисовки листьев
@@ -1679,32 +1706,19 @@ func decodeRegionJobs(
 	}
 
 	// Внутренний узел - делим так же, как в encodeRegion/collectRegionColors.
-	if w >= h && w > 1 {
-		w1 := w / 2
-		w2 := w - w1
-		if err := decodeRegionJobs(x, y, w1, h, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
-			return err
-		}
-		if err := decodeRegionJobs(x+w1, y, w2, h, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
-			return err
-		}
-		return nil
+	sp, ok := splitNode(x, y, w, h, w >= h)
+	if !ok {
+		// Встретили внутренний узел, который уже нельзя делить по геометрии.
+		return fmt.Errorf("decodeRegionJobs: internal node with non-divisible geometry (%d×%d)", w, h)
 	}
 
-	if h > 1 {
-		h1 := h / 2
-		h2 := h - h1
-		if err := decodeRegionJobs(x, y, w, h1, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
-			return err
-		}
-		if err := decodeRegionJobs(x, y+h1, w, h2, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
-			return err
-		}
-		return nil
+	if err := decodeRegionJobs(sp.x1, sp.y1, sp.w1, sp.h1, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
+		return err
 	}
-
-	// Встретили внутренний узел, который уже нельзя делить по геометрии.
-	return fmt.Errorf("decodeRegionJobs: internal node with non-divisible geometry (%d×%d)", w, h)
+	if err := decodeRegionJobs(sp.x2, sp.y2, sp.w2, sp.h2, params, br, patBr, dst, palettes, leafCounts, curPal, usedInPal, leafBytes, leafPos, jobs); err != nil {
+		return err
+	}
+	return nil
 }
 
 func paintLeafJobsParallel(dst *image.RGBA, palettes [][]color.RGBA, jobs []leafJob) {

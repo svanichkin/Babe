@@ -4,21 +4,20 @@ import (
 	"bytes"
 	"image"
 	"image/jpeg"
-	"image/png"
 	"os"
 	"testing"
 )
 
 func loadTestImage(b *testing.B) image.Image {
-	f, err := os.Open("test_.png")
+	f, err := os.Open("test.jpg")
 	if err != nil {
-		b.Fatalf("failed to open test_.png: %v", err)
+		b.Fatalf("failed to open test.jpg: %v", err)
 	}
 	defer f.Close()
 
-	img, err := png.Decode(f)
+	img, err := jpeg.Decode(f)
 	if err != nil {
-		b.Fatalf("failed to decode test_.jpg: %v", err)
+		b.Fatalf("failed to decode test.jpg: %v", err)
 	}
 	return img
 }
