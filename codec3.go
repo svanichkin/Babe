@@ -1646,10 +1646,16 @@ func decodeRegionJobs(
 				if px < bounds.Min.X || py < bounds.Min.Y || px >= bounds.Max.X || py >= bounds.Max.Y {
 					continue
 				}
+				rowOff := (py - bounds.Min.Y) * dst.YStride
+				i := rowOff + (px - bounds.Min.X)
 				if bit {
-					setYCbCr(dst, px, py, fg)
+					dst.Y[i] = fg.Y
+					dst.Cb[i] = fg.Cb
+					dst.Cr[i] = fg.Cr
 				} else {
-					setYCbCr(dst, px, py, bg)
+					dst.Y[i] = bg.Y
+					dst.Cb[i] = bg.Cb
+					dst.Cr[i] = bg.Cr
 				}
 			}
 		}
@@ -1964,26 +1970,95 @@ func (br *BitReader) ReadByte() (byte, error) {
 	return b, nil
 }
 
-// smoothJunctions performs gradient-based smoothing at intersections of blocks
-// with a given nominal blockSize (usually params.minBlock from the codec),
-// работая напрямую в пространстве YCbCr 4:4:4.
-func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
-	b := img.Bounds()
+
+// Combined block and junction smoothing in a single pass.
+func smoothBlocks(src *image.YCbCr, blockSize int) *image.YCbCr {
+	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
 
 	if blockSize <= 1 {
-		// сетка слишком плотная — фактически нет "квадратов"
-		return img
+		return src
 	}
-
 	if w < 2*blockSize || h < 2*blockSize {
-		return img
+		return src
 	}
 
-	stride := img.YStride
+	// Work on a copy so callers can still reuse src if they want.
+	dst := image.NewYCbCr(b, image.YCbCrSubsampleRatio444)
+	copy(dst.Y, src.Y)
+	copy(dst.Cb, src.Cb)
+	copy(dst.Cr, src.Cr)
+
+	stride := dst.YStride
 	minX := b.Min.X
 	minY := b.Min.Y
 
+	// ------------------------------------------------------------------
+	// Step 1: smooth flat block boundaries (old smoothFlatAreas logic).
+	// ------------------------------------------------------------------
+	const boundaryLumaThreshold int32 = 10
+
+	// Vertical block boundaries.
+	for x := b.Min.X + blockSize; x < b.Max.X; x += blockSize {
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			rowOff := (y - minY) * stride
+			iL := rowOff + (x - 1 - minX)
+			iR := rowOff + (x - minX)
+
+			lL := int32(dst.Y[iL])
+			lR := int32(dst.Y[iR])
+			d := lL - lR
+			if d < 0 {
+				d = -d
+			}
+			if d <= boundaryLumaThreshold {
+				yAvg := uint8((uint16(dst.Y[iL]) + uint16(dst.Y[iR])) / 2)
+				cbAvg := uint8((uint16(dst.Cb[iL]) + uint16(dst.Cb[iR])) / 2)
+				crAvg := uint8((uint16(dst.Cr[iL]) + uint16(dst.Cr[iR])) / 2)
+
+				dst.Y[iL] = yAvg
+				dst.Y[iR] = yAvg
+				dst.Cb[iL] = cbAvg
+				dst.Cb[iR] = cbAvg
+				dst.Cr[iL] = crAvg
+				dst.Cr[iR] = crAvg
+			}
+		}
+	}
+
+	// Horizontal block boundaries.
+	for y := b.Min.Y + blockSize; y < b.Max.Y; y += blockSize {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			rowOffT := (y - 1 - minY) * stride
+			rowOffB := (y - minY) * stride
+			iT := rowOffT + (x - minX)
+			iB := rowOffB + (x - minX)
+
+			lT := int32(dst.Y[iT])
+			lB := int32(dst.Y[iB])
+			d := lT - lB
+			if d < 0 {
+				d = -d
+			}
+			if d <= boundaryLumaThreshold {
+				yAvg := uint8((uint16(dst.Y[iT]) + uint16(dst.Y[iB])) / 2)
+				cbAvg := uint8((uint16(dst.Cb[iT]) + uint16(dst.Cb[iB])) / 2)
+				crAvg := uint8((uint16(dst.Cr[iT]) + uint16(dst.Cr[iB])) / 2)
+
+				dst.Y[iT] = yAvg
+				dst.Y[iB] = yAvg
+				dst.Cb[iT] = cbAvg
+				dst.Cb[iB] = cbAvg
+				dst.Cr[iT] = crAvg
+				dst.Cr[iB] = crAvg
+			}
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// Step 2: smooth block junctions (old smoothJunctions logic),
+	// now working in-place on dst.
+	// ------------------------------------------------------------------
 	maxRadius := blockSize
 	if maxRadius > 3 {
 		maxRadius = 3
@@ -2006,10 +2081,10 @@ func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
 			off01 := (y-minY)*stride + (x - 1 - minX)
 			off11 := (y-minY)*stride + (x - minX)
 
-			c00 := color.YCbCr{Y: img.Y[off00], Cb: img.Cb[off00], Cr: img.Cr[off00]}
-			c10 := color.YCbCr{Y: img.Y[off10], Cb: img.Cb[off10], Cr: img.Cr[off10]}
-			c01 := color.YCbCr{Y: img.Y[off01], Cb: img.Cb[off01], Cr: img.Cr[off01]}
-			c11 := color.YCbCr{Y: img.Y[off11], Cb: img.Cb[off11], Cr: img.Cr[off11]}
+			c00 := color.YCbCr{Y: dst.Y[off00], Cb: dst.Cb[off00], Cr: dst.Cr[off00]}
+			c10 := color.YCbCr{Y: dst.Y[off10], Cb: dst.Cb[off10], Cr: dst.Cr[off10]}
+			c01 := color.YCbCr{Y: dst.Y[off01], Cb: dst.Cb[off01], Cr: dst.Cr[off01]}
+			c11 := color.YCbCr{Y: dst.Y[off11], Cb: dst.Cb[off11], Cr: dst.Cr[off11]}
 
 			l00 := int32(c00.Y)
 			l10 := int32(c10.Y)
@@ -2031,10 +2106,10 @@ func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
 
 			L := 0
 			for i := 1; i <= maxRadius && x-i >= b.Min.X; i++ {
-				upOff := (y-1-minY)*stride + (x-i-minX)*stride/stride
-				downOff := (y-minY)*stride + (x-i-minX)*stride/stride
-				up := color.YCbCr{Y: img.Y[upOff], Cb: img.Cb[upOff], Cr: img.Cr[upOff]}
-				down := color.YCbCr{Y: img.Y[downOff], Cb: img.Cb[downOff], Cr: img.Cr[downOff]}
+				upOff := (y-1-minY)*stride + (x-i-minX)
+				downOff := (y-minY)*stride + (x-i-minX)
+				up := color.YCbCr{Y: dst.Y[upOff], Cb: dst.Cb[upOff], Cr: dst.Cr[upOff]}
+				down := color.YCbCr{Y: dst.Y[downOff], Cb: dst.Cb[downOff], Cr: dst.Cr[downOff]}
 				if !similar(up, c00) || !similar(down, c01) {
 					break
 				}
@@ -2045,8 +2120,8 @@ func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
 			for i := 1; i <= maxRadius && x-1+i < b.Max.X; i++ {
 				upOff := (y-1-minY)*stride + (x - 1 + i - minX)
 				downOff := (y-minY)*stride + (x - 1 + i - minX)
-				up := color.YCbCr{Y: img.Y[upOff], Cb: img.Cb[upOff], Cr: img.Cr[upOff]}
-				down := color.YCbCr{Y: img.Y[downOff], Cb: img.Cb[downOff], Cr: img.Cr[downOff]}
+				up := color.YCbCr{Y: dst.Y[upOff], Cb: dst.Cb[upOff], Cr: dst.Cr[upOff]}
+				down := color.YCbCr{Y: dst.Y[downOff], Cb: dst.Cb[downOff], Cr: dst.Cr[downOff]}
 				if !similar(up, c10) || !similar(down, c11) {
 					break
 				}
@@ -2057,8 +2132,8 @@ func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
 			for i := 1; i <= maxRadius && y-i >= b.Min.Y; i++ {
 				leftOff := (y-i-minY)*stride + (x - 1 - minX)
 				rightOff := (y-i-minY)*stride + (x - minX)
-				left := color.YCbCr{Y: img.Y[leftOff], Cb: img.Cb[leftOff], Cr: img.Cr[leftOff]}
-				right := color.YCbCr{Y: img.Y[rightOff], Cb: img.Cb[rightOff], Cr: img.Cr[rightOff]}
+				left := color.YCbCr{Y: dst.Y[leftOff], Cb: dst.Cb[leftOff], Cr: dst.Cr[leftOff]}
+				right := color.YCbCr{Y: dst.Y[rightOff], Cb: dst.Cb[rightOff], Cr: dst.Cr[rightOff]}
 				if !similar(left, c00) || !similar(right, c10) {
 					break
 				}
@@ -2069,8 +2144,8 @@ func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
 			for i := 1; i <= maxRadius && y-1+i < b.Max.Y; i++ {
 				leftOff := (y-1+i-minY)*stride + (x - 1 - minX)
 				rightOff := (y-1+i-minY)*stride + (x - minX)
-				left := color.YCbCr{Y: img.Y[leftOff], Cb: img.Cb[leftOff], Cr: img.Cr[leftOff]}
-				right := color.YCbCr{Y: img.Y[rightOff], Cb: img.Cb[rightOff], Cr: img.Cr[rightOff]}
+				left := color.YCbCr{Y: dst.Y[leftOff], Cb: dst.Cb[leftOff], Cr: dst.Cr[leftOff]}
+				right := color.YCbCr{Y: dst.Y[rightOff], Cb: dst.Cb[rightOff], Cr: dst.Cr[rightOff]}
 				if !similar(left, c01) || !similar(right, c11) {
 					break
 				}
@@ -2100,6 +2175,7 @@ func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
 
 			for py := rectMinY; py <= rectMaxY; py++ {
 				v := float64(py-rectMinY) / float64(height)
+				rowOff := (py - minY) * stride
 				for px := rectMinX; px <= rectMaxX; px++ {
 					u := float64(px-rectMinX) / float64(width)
 
@@ -2115,89 +2191,15 @@ func smoothJunctions(img *image.YCbCr, blockSize int) *image.YCbCr {
 					cbv := lerp8(cbTop, cbBot, v)
 					crv := lerp8(crTop, crBot, v)
 
-					setYCbCr(img, px, py, color.YCbCr{Y: yv, Cb: cbv, Cr: crv})
+					idx := rowOff + (px - minX)
+					dst.Y[idx] = yv
+					dst.Cb[idx] = cbv
+					dst.Cr[idx] = crv
 				}
 			}
 		}
 	}
-	return img
-}
 
-func smoothBlocks(src *image.YCbCr, blockSize int) *image.YCbCr {
-	return smoothJunctions(smoothFlatAreas(src, blockSize), blockSize)
-}
-
-func smoothFlatAreas(src *image.YCbCr, blockSize int) *image.YCbCr {
-	b := src.Bounds()
-	w, h := b.Dx(), b.Dy()
-
-	if blockSize <= 1 {
-		return src
-	}
-	if w < 2*blockSize || h < 2*blockSize {
-		return src
-	}
-
-	dst := image.NewYCbCr(b, image.YCbCrSubsampleRatio444)
-	// Копируем исходные данные.
-	copy(dst.Y, src.Y)
-	copy(dst.Cb, src.Cb)
-	copy(dst.Cr, src.Cr)
-
-	stride := src.YStride
-	minX := b.Min.X
-	minY := b.Min.Y
-
-	const boundaryLumaThreshold int32 = 10
-
-	// Вертикальные границы блоков.
-	for x := b.Min.X + blockSize; x < b.Max.X; x += blockSize {
-		for y := b.Min.Y; y < b.Max.Y; y++ {
-			rowOff := (y - minY) * stride
-			iL := rowOff + (x - 1 - minX)
-			iR := rowOff + (x - minX)
-
-			lL := int32(src.Y[iL])
-			lR := int32(src.Y[iR])
-			d := lL - lR
-			if d < 0 {
-				d = -d
-			}
-			if d <= boundaryLumaThreshold {
-				yAvg := uint8((uint16(src.Y[iL]) + uint16(src.Y[iR])) / 2)
-				cbAvg := uint8((uint16(src.Cb[iL]) + uint16(src.Cb[iR])) / 2)
-				crAvg := uint8((uint16(src.Cr[iL]) + uint16(src.Cr[iR])) / 2)
-				cAvg := color.YCbCr{Y: yAvg, Cb: cbAvg, Cr: crAvg}
-				setYCbCr(dst, x-1, y, cAvg)
-				setYCbCr(dst, x, y, cAvg)
-			}
-		}
-	}
-
-	// Горизонтальные границы блоков.
-	for y := b.Min.Y + blockSize; y < b.Max.Y; y += blockSize {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			rowOffT := (y - 1 - minY) * stride
-			rowOffB := (y - minY) * stride
-			iT := rowOffT + (x - minX)
-			iB := rowOffB + (x - minX)
-
-			lT := int32(src.Y[iT])
-			lB := int32(src.Y[iB])
-			d := lT - lB
-			if d < 0 {
-				d = -d
-			}
-			if d <= boundaryLumaThreshold {
-				yAvg := uint8((uint16(src.Y[iT]) + uint16(src.Y[iB])) / 2)
-				cbAvg := uint8((uint16(src.Cb[iT]) + uint16(src.Cb[iB])) / 2)
-				crAvg := uint8((uint16(src.Cr[iT]) + uint16(src.Cr[iB])) / 2)
-				cAvg := color.YCbCr{Y: yAvg, Cb: cbAvg, Cr: crAvg}
-				setYCbCr(dst, x, y-1, cAvg)
-				setYCbCr(dst, x, y, cAvg)
-			}
-		}
-	}
 	return dst
 }
 
