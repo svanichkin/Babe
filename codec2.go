@@ -18,7 +18,7 @@ import (
 // API: Encode(img, quality) and Decode(data).
 
 const (
-	magicCodec2 = "BAB2"
+	magicCodec2 = "BABE\n"
 )
 
 // Encode encodes the given image with the given quality (1–100).
