@@ -1,6 +1,6 @@
 // BABE (Bi-Level Adaptive Block Encoding) is a dual-tone block codec for images.
-// It uses adaptive block sizes (small and macro blocks), a palette in YCbCr
-// color space, delta-coded palette indices, and a light post-process for deblocking
+// It operates in YCbCr color space, uses adaptive block sizes (small and macro blocks)
+// and per-channel bi-level patterns, plus a light post-process for deblocking
 // and gradient smoothing.
 
 package main
@@ -32,22 +32,16 @@ var (
 	macroBlock = 2
 )
 
-// current encode quality in [0..100]; used to drive macro/small decisions more aggressively.
+// current encode quality in [0..100]; used to drive macro/small decisions.
 var encQuality int = 100
 
 // Quality mapping:
-// - quality is expected in [0..100]
-// - smallBlock is fixed to 1
-// - macroBlock goes linearly from 100 (at quality=0) down to 2 (at quality=100)
+// - quality is in [0..100]
+// - smallBlock/macroBlock are chosen from a small set of presets
+//   to trade off quality vs. compression.
 
 // setBlocksForQuality configures global smallBlock/macroBlock based on a quality in [0..100].
-// We use a small set of discrete presets:
-//
-//	quality ≈100% → 1/2
-//	mid-high      → 1/3
-//	mid           → 2/4
-//	mid-low       → 3/6
-//	low (0%)      → 4/8
+// It uses a small set of discrete presets to keep the behavior stable and predictable.
 func setBlocksForQuality(quality int) error {
 	// clamp quality to [0..100]
 	if quality < 0 {
@@ -79,9 +73,6 @@ func setBlocksForQuality(quality int) error {
 		smallBlock = 4
 		macroBlock = 8
 	}
-
-	fmt.Printf("QUALITY: %d, smallBlock=%d, macroBlock=%d\n",
-		encQuality, smallBlock, macroBlock)
 
 	return nil
 }
@@ -168,26 +159,39 @@ const (
 	chCr = 2
 )
 
-// channelValue extracts the selected channel from a YCbCr triplet.
-func channelValue(ycc yuv, ch int) uint8 {
-	switch ch {
-	case chY:
-		return uint8(ycc.Y)
-	case chCb:
-		return uint8(ycc.Cb)
-	case chCr:
-		return uint8(ycc.Cr)
-	default:
-		return uint8(ycc.Y)
+// extractYCbCrPlanes converts an image.Image into three planar Y, Cb, Cr slices.
+// Each plane has size w*h and is indexed as plane[y*w + x] with 0 <= x < w and 0 <= y < h.
+func extractYCbCrPlanes(img image.Image) ([]uint8, []uint8, []uint8, int, int) {
+	b := img.Bounds()
+	w := b.Dx()
+	h := b.Dy()
+	yPlane := make([]uint8, w*h)
+	cbPlane := make([]uint8, w*h)
+	crPlane := make([]uint8, w*h)
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := img.At(b.Min.X+x, b.Min.Y+y)
+			r16, g16, b16, _ := c.RGBA()
+			r8 := uint8(r16 >> 8)
+			g8 := uint8(g16 >> 8)
+			b8 := uint8(b16 >> 8)
+			ycc := rgbToYCbCr(r8, g8, b8)
+			idx := y*w + x
+			yPlane[idx] = uint8(ycc.Y)
+			cbPlane[idx] = uint8(ycc.Cb)
+			crPlane[idx] = uint8(ycc.Cr)
+		}
 	}
+
+	return yPlane, cbPlane, crPlane, w, h
 }
 
 // canUseBigBlockChannel decides whether a macroBlock region can be encoded as a single block
-// for the given channel. It uses a quality-dependent spread threshold: lower quality allows
-// larger spread (more macroBlocks), higher quality reduces spread (more small blocks).
-func canUseBigBlockChannel(img image.Image, ch, x0, y0 int) bool {
-	b := img.Bounds()
-	if x0+macroBlock > b.Max.X || y0+macroBlock > b.Max.Y {
+// for the given channel plane. It uses a quality-dependent spread threshold: lower quality
+// allows larger spread (more macroBlocks), higher quality reduces spread (more small blocks).
+func canUseBigBlockChannel(plane []uint8, stride, height, x0, y0 int) bool {
+	if x0+macroBlock > stride || y0+macroBlock > height {
 		return false
 	}
 
@@ -195,13 +199,11 @@ func canUseBigBlockChannel(img image.Image, ch, x0, y0 int) bool {
 	first := true
 	for yy := 0; yy < macroBlock; yy++ {
 		for xx := 0; xx < macroBlock; xx++ {
-			c := img.At(x0+xx, y0+yy)
-			r16, g16, b16, _ := c.RGBA()
-			r8 := uint8(r16 >> 8)
-			g8 := uint8(g16 >> 8)
-			b8 := uint8(b16 >> 8)
-			ycc := rgbToYCbCr(r8, g8, b8)
-			v := int32(channelValue(ycc, ch))
+			idx := (y0+yy)*stride + (x0 + xx)
+			if idx < 0 || idx >= len(plane) {
+				return false
+			}
+			v := int32(plane[idx])
 			if first {
 				minV, maxV = v, v
 				first = false
@@ -217,9 +219,9 @@ func canUseBigBlockChannel(img image.Image, ch, x0, y0 int) bool {
 	}
 
 	// quality-dependent spread:
-	// в КАЖДОМ диапазоне качества (0–19, 20–39, 40–59, 60–79, 80–100),
-	// которые мы используем для подбора smallBlock/macroBlock,
-	// spread меняется линейно от 64 (внизу диапазона) до 8 (вверху диапазона).
+	// in each quality band (0–19, 20–39, 40–59, 60–79, 80–100) that we use
+	// for smallBlock/macroBlock selection, the allowed spread changes linearly
+	// from 64 (bottom of the band) down to 8 (top of the band).
 	q := encQuality
 	if q < 0 {
 		q = 0
@@ -228,7 +230,7 @@ func canUseBigBlockChannel(img image.Image, ch, x0, y0 int) bool {
 		q = 100
 	}
 
-	// подобрать границы диапазона качества в точности как в setBlocksForQuality:
+	// Use the same quality bands as setBlocksForQuality:
 	//   [0–19]  → 4/8
 	//   [20–39] → 3/6
 	//   [40–59] → 2/4
@@ -248,7 +250,7 @@ func canUseBigBlockChannel(img image.Image, ch, x0, y0 int) bool {
 		groupStart, groupEnd = 80, 100
 	}
 
-	// линейная интерполяция от 64 до 8 внутри выбранного диапазона
+	// Linear interpolation of the allowed spread from 64 down to 8 within the band.
 	const spreadMax int32 = 64
 	const spreadMin int32 = 8
 	span := groupEnd - groupStart
@@ -263,13 +265,10 @@ func canUseBigBlockChannel(img image.Image, ch, x0, y0 int) bool {
 	return (maxV - minV) < spread
 }
 
-// encodeBlockChannel encodes a single block for one channel:
-// it computes a mean-based threshold, writes the FG/BG pattern bits, and returns FG/BG levels.
-func encodeBlockChannel(img image.Image, ch, x0, y0, bw, bh int, pw *BitWriter) (uint8, uint8, error) {
-	b := img.Bounds()
-	if x0 < b.Min.X || y0 < b.Min.Y || x0+bw > b.Max.X || y0+bh > b.Max.Y {
-		return 0, 0, fmt.Errorf("block out of bounds")
-	}
+// encodeBlockPlane encodes a single block for one planar channel:
+// it computes a mean-based threshold, writes the FG/BG pattern bits (if pw != nil),
+// and computes FG/BG levels.
+func encodeBlockPlane(plane []uint8, stride, x0, y0, bw, bh int, pw *BitWriter) (uint8, uint8, error) {
 	total := bw * bh
 	if total <= 0 {
 		return 0, 0, fmt.Errorf("invalid block size")
@@ -279,13 +278,11 @@ func encodeBlockChannel(img image.Image, ch, x0, y0, bw, bh int, pw *BitWriter) 
 	var sum uint64
 	for yy := 0; yy < bh; yy++ {
 		for xx := 0; xx < bw; xx++ {
-			c := img.At(x0+xx, y0+yy)
-			r16, g16, b16, _ := c.RGBA()
-			r8 := uint8(r16 >> 8)
-			g8 := uint8(g16 >> 8)
-			b8 := uint8(b16 >> 8)
-			ycc := rgbToYCbCr(r8, g8, b8)
-			val := channelValue(ycc, ch)
+			idx := (y0+yy)*stride + (x0 + xx)
+			if idx < 0 || idx >= len(plane) {
+				return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
+			}
+			val := plane[idx]
 			sum += uint64(val)
 		}
 	}
@@ -295,31 +292,36 @@ func encodeBlockChannel(img image.Image, ch, x0, y0, bw, bh int, pw *BitWriter) 
 	var fgSum, bgSum uint64
 	var fgCnt, bgCnt uint32
 
+	emitBit := func(isFg bool) error {
+		if pw != nil {
+			if err := pw.WriteBit(isFg); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	for yy := 0; yy < bh; yy++ {
 		for xx := 0; xx < bw; xx++ {
-			c := img.At(x0+xx, y0+yy)
-			r16, g16, b16, _ := c.RGBA()
-			r8 := uint8(r16 >> 8)
-			g8 := uint8(g16 >> 8)
-			b8 := uint8(b16 >> 8)
-			ycc := rgbToYCbCr(r8, g8, b8)
-			val := int32(channelValue(ycc, ch))
-
-			isFg := val >= thr
-			if pw != nil {
-				if err := pw.WriteBit(isFg); err != nil {
-					return 0, 0, err
-				}
+			idx := (y0+yy)*stride + (x0 + xx)
+			if idx < 0 || idx >= len(plane) {
+				return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
+			}
+			v := int32(plane[idx])
+			isFg := v >= thr
+			if err := emitBit(isFg); err != nil {
+				return 0, 0, err
 			}
 			if isFg {
-				fgSum += uint64(val)
+				fgSum += uint64(v)
 				fgCnt++
 			} else {
-				bgSum += uint64(val)
+				bgSum += uint64(v)
 				bgCnt++
 			}
 		}
 	}
+
 
 	// handle degenerate cases: if one of the groups is empty, fall back to the global mean
 	avg := uint8(sum / uint64(total))
@@ -330,12 +332,13 @@ func encodeBlockChannel(img image.Image, ch, x0, y0, bw, bh int, pw *BitWriter) 
 		fg = uint8(fgSum / uint64(fgCnt))
 		bg = uint8(bgSum / uint64(bgCnt))
 	}
+
 	return fg, bg, nil
 }
 
-// encodeChannel builds one complete stream for a single channel (Y, Cb, or Cr):
+// encodeChannel builds one complete stream for a single planar channel:
 // its own block list, size stream, pattern stream, and per-block FG/BG levels.
-func encodeChannel(img image.Image, ch int, w4, h4, fullW, fullH int, useMacro bool) ([]blockMetaCh, []byte, []byte, error) {
+func encodeChannel(plane []uint8, stride, w4, h4, fullW, fullH int, useMacro bool) ([]blockMetaCh, []byte, []byte, []byte, []uint8, []uint8, error) {
 	// macro-block decision bits (only for main fullW x fullH area)
 	var macroUseBig []bool
 	var blocks []blockMetaCh
@@ -345,13 +348,26 @@ func encodeChannel(img image.Image, ch int, w4, h4, fullW, fullH int, useMacro b
 	var patternBuf bytes.Buffer
 	patternW := NewBitWriter(&patternBuf)
 
+	var typeBuf bytes.Buffer
+	typeW := NewBitWriter(&typeBuf)
+
+	var fgVals []uint8
+	var bgVals []uint8
+
+	height := h4
+
 	// main macroBlock x macroBlock area
 	for my := 0; my < fullH; my += macroBlock {
 		for mx := 0; mx < fullW; mx += macroBlock {
-			if useMacro && canUseBigBlockChannel(img, ch, mx, my) {
-				fg, bg, err := encodeBlockChannel(img, ch, mx, my, macroBlock, macroBlock, patternW)
+			if useMacro && canUseBigBlockChannel(plane, stride, height, mx, my) {
+				fg, bg, err := encodeBlockPlane(plane, stride, mx, my, macroBlock, macroBlock, patternW)
 				if err != nil {
-					return nil, nil, nil, err
+					return nil, nil, nil, nil, nil, nil, err
+				}
+				fgVals = append(fgVals, fg)
+				bgVals = append(bgVals, bg)
+				if err := typeW.WriteBit(true); err != nil { // always pattern
+					return nil, nil, nil, nil, nil, nil, err
 				}
 				blocks = append(blocks, blockMetaCh{fg: fg, bg: bg, isBig: true})
 				macroUseBig = append(macroUseBig, true)
@@ -362,12 +378,19 @@ func encodeChannel(img image.Image, ch int, w4, h4, fullW, fullH int, useMacro b
 						xx, yy := mx+bx, my+by
 						// for smallBlock > 1 we also emit pattern bits; for smallBlock == 1 we skip pattern bits
 						var pw *BitWriter
+						isPattern := false
 						if smallBlock > 1 {
 							pw = patternW
+							isPattern = true
 						}
-						fg, bg, err := encodeBlockChannel(img, ch, xx, yy, smallBlock, smallBlock, pw)
+						fg, bg, err := encodeBlockPlane(plane, stride, xx, yy, smallBlock, smallBlock, pw)
 						if err != nil {
-							return nil, nil, nil, err
+							return nil, nil, nil, nil, nil, nil, err
+						}
+						fgVals = append(fgVals, fg)
+						bgVals = append(bgVals, bg)
+						if err := typeW.WriteBit(isPattern); err != nil {
+							return nil, nil, nil, nil, nil, nil, err
 						}
 						blocks = append(blocks, blockMetaCh{fg: fg, bg: bg, isBig: false})
 					}
@@ -381,12 +404,19 @@ func encodeChannel(img image.Image, ch int, w4, h4, fullW, fullH int, useMacro b
 	for my := 0; my < fullH; my += smallBlock {
 		for mx := fullW; mx < w4; mx += smallBlock {
 			var pw *BitWriter
+			isPattern := false
 			if smallBlock > 1 {
 				pw = patternW
+				isPattern = true
 			}
-			fg, bg, err := encodeBlockChannel(img, ch, mx, my, smallBlock, smallBlock, pw)
+			fg, bg, err := encodeBlockPlane(plane, stride, mx, my, smallBlock, smallBlock, pw)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, nil, nil, err
+			}
+			fgVals = append(fgVals, fg)
+			bgVals = append(bgVals, bg)
+			if err := typeW.WriteBit(isPattern); err != nil {
+				return nil, nil, nil, nil, nil, nil, err
 			}
 			blocks = append(blocks, blockMetaCh{fg: fg, bg: bg, isBig: false})
 		}
@@ -395,12 +425,19 @@ func encodeChannel(img image.Image, ch int, w4, h4, fullW, fullH int, useMacro b
 	for my := fullH; my < h4; my += smallBlock {
 		for mx := 0; mx < w4; mx += smallBlock {
 			var pw *BitWriter
+			isPattern := false
 			if smallBlock > 1 {
 				pw = patternW
+				isPattern = true
 			}
-			fg, bg, err := encodeBlockChannel(img, ch, mx, my, smallBlock, smallBlock, pw)
+			fg, bg, err := encodeBlockPlane(plane, stride, mx, my, smallBlock, smallBlock, pw)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, nil, nil, err
+			}
+			fgVals = append(fgVals, fg)
+			bgVals = append(bgVals, bg)
+			if err := typeW.WriteBit(isPattern); err != nil {
+				return nil, nil, nil, nil, nil, nil, err
 			}
 			blocks = append(blocks, blockMetaCh{fg: fg, bg: bg, isBig: false})
 		}
@@ -409,17 +446,20 @@ func encodeChannel(img image.Image, ch int, w4, h4, fullW, fullH int, useMacro b
 	// write macroUseBig bits for the main area into the size stream
 	for _, useBig := range macroUseBig {
 		if err := sizeW.WriteBit(useBig); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, err
 		}
 	}
 	if err := sizeW.Flush(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	if err := typeW.Flush(); err != nil {
+		return nil, nil, nil, nil, nil, nil, err
 	}
 	if err := patternW.Flush(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
-	return blocks, sizeBuf.Bytes(), patternBuf.Bytes(), nil
+	return blocks, sizeBuf.Bytes(), typeBuf.Bytes(), patternBuf.Bytes(), fgVals, bgVals, nil
 }
 
 // Encode runs the BABE encoder with three fully independent channel streams (Y, Cb, Cr).
@@ -429,9 +469,7 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 		return nil, err
 	}
 
-	b := img.Bounds()
-	w := b.Dx()
-	h := b.Dy()
+	yPlane, cbPlane, crPlane, w, h := extractYCbCrPlanes(img)
 
 	var raw bytes.Buffer
 	bw := bufio.NewWriter(&raw)
@@ -471,7 +509,10 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	type channelResult struct {
 		blocks       []blockMetaCh
 		sizeBytes    []byte
+		typeBytes    []byte
 		patternBytes []byte
+		fgVals       []uint8
+		bgVals       []uint8
 		err          error
 	}
 
@@ -481,19 +522,23 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	)
 
 	channelIDs := []int{chY, chCb, chCr}
+	planes := [][]uint8{yPlane, cbPlane, crPlane}
 
-	for i, ch := range channelIDs {
+	for i := range planes {
 		wg.Add(1)
-		go func(i, ch int) {
+		go func(i int) {
 			defer wg.Done()
-			blocks, sizeBytes, patternBytes, err := encodeChannel(img, ch, w4, h4, fullW, fullH, useMacro)
+			blocks, sizeBytes, typeBytes, patternBytes, fgVals, bgVals, err := encodeChannel(planes[i], w, w4, h4, fullW, fullH, useMacro)
 			results[i] = channelResult{
 				blocks:       blocks,
 				sizeBytes:    sizeBytes,
+				typeBytes:    typeBytes,
 				patternBytes: patternBytes,
+				fgVals:       fgVals,
+				bgVals:       bgVals,
 				err:          err,
 			}
-		}(i, ch)
+		}(i)
 	}
 
 	wg.Wait()
@@ -518,6 +563,13 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 		if _, err := bw.Write(res.sizeBytes); err != nil {
 			return nil, err
 		}
+		// write type stream for this channel
+		if err := binary.Write(bw, binary.BigEndian, uint32(len(res.typeBytes))); err != nil {
+			return nil, err
+		}
+		if _, err := bw.Write(res.typeBytes); err != nil {
+			return nil, err
+		}
 		// write pattern stream for this channel
 		if err := binary.Write(bw, binary.BigEndian, uint32(len(res.patternBytes))); err != nil {
 			return nil, err
@@ -525,17 +577,76 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 		if _, err := bw.Write(res.patternBytes); err != nil {
 			return nil, err
 		}
-		// write FG/BG levels:
-		// - if smallBlock == 1: 1 byte per smallBlock (FG only), 2 bytes per macroBlock (FG+BG)
-		// - if smallBlock > 1: 2 bytes per block (FG+BG) for both small and macro blocks
-		for _, blk := range res.blocks {
-			if err := bw.WriteByte(blk.fg); err != nil {
+		// write FG array:
+		// mode 0 = delta-coded via DeltaPackBytes (used for Y),
+		// mode 1 = packed with PackBytes (used for Cb/Cr).
+		chID := channelIDs[i]
+		if chID == chY {
+			// Y channel: delta scheme via DeltaPackBytes
+			if err := bw.WriteByte(0); err != nil {
 				return nil, err
 			}
-			if blk.isBig || smallBlock > 1 {
-				if err := bw.WriteByte(blk.bg); err != nil {
-					return nil, err
-				}
+			packedFG, err := DeltaPackBytes(res.fgVals)
+			if err != nil {
+				return nil, err
+			}
+			fgLen := uint32(len(packedFG))
+			if err := binary.Write(bw, binary.BigEndian, fgLen); err != nil {
+				return nil, err
+			}
+			if _, err := bw.Write(packedFG); err != nil {
+				return nil, err
+			}
+		} else {
+			// Cb/Cr: pack with PackBytes
+			if err := bw.WriteByte(1); err != nil {
+				return nil, err
+			}
+			packedFG, err := DeltaPackBytes(res.fgVals)
+			if err != nil {
+				return nil, err
+			}
+			fgLen := uint32(len(packedFG))
+			if err := binary.Write(bw, binary.BigEndian, fgLen); err != nil {
+				return nil, err
+			}
+			if _, err := bw.Write(packedFG); err != nil {
+				return nil, err
+			}
+		}
+
+		// write BG array:
+		if chID == chY {
+			// Y channel: delta scheme via DeltaPackBytes
+			if err := bw.WriteByte(0); err != nil {
+				return nil, err
+			}
+			packedBG, err := DeltaPackBytes(res.bgVals)
+			if err != nil {
+				return nil, err
+			}
+			bgLen := uint32(len(packedBG))
+			if err := binary.Write(bw, binary.BigEndian, bgLen); err != nil {
+				return nil, err
+			}
+			if _, err := bw.Write(packedBG); err != nil {
+				return nil, err
+			}
+		} else {
+			// Cb/Cr: pack with PackBytes
+			if err := bw.WriteByte(1); err != nil {
+				return nil, err
+			}
+			packedBG, err := DeltaPackBytes(res.bgVals)
+			if err != nil {
+				return nil, err
+			}
+			bgLen := uint32(len(packedBG))
+			if err := binary.Write(bw, binary.BigEndian, bgLen); err != nil {
+				return nil, err
+			}
+			if _, err := bw.Write(packedBG); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -543,10 +654,12 @@ func Encode(img image.Image, quality int) ([]byte, error) {
 	if err := bw.Flush(); err != nil {
 		return nil, err
 	}
-	comp, err := compressZstd(raw.Bytes())
+	rawBytes := raw.Bytes()
+	comp, err := compressZstd(rawBytes)
 	if err != nil {
 		return nil, fmt.Errorf("zstd encode: %w", err)
 	}
+
 	return comp, nil
 }
 
@@ -586,6 +699,151 @@ func fillBlockPlane(plane []uint8, stride int, x0, y0, bw, bh int, val uint8) er
 	return nil
 }
 
+// readChannelSegment reads a single channel stream (as written by Encode)
+// from the shared reader into a standalone byte slice. The layout of this
+// slice matches what decodeChannel expects, so decodeChannel can run on
+// an independent reader in parallel for each channel.
+func readChannelSegment(br *bufio.Reader) ([]byte, error) {
+	var tmp4 [4]byte
+
+	// blockCount (4 bytes)
+	if _, err := io.ReadFull(br, tmp4[:]); err != nil {
+		return nil, err
+	}
+	blockCount := binary.BigEndian.Uint32(tmp4[:])
+
+	// sizeStreamLen (4 bytes)
+	if _, err := io.ReadFull(br, tmp4[:]); err != nil {
+		return nil, err
+	}
+	sizeStreamLen := binary.BigEndian.Uint32(tmp4[:])
+
+	// typeStreamLen (4 bytes)
+	if _, err := io.ReadFull(br, tmp4[:]); err != nil {
+		return nil, err
+	}
+	typeStreamLen := binary.BigEndian.Uint32(tmp4[:])
+
+	// patternLen (4 bytes)
+	if _, err := io.ReadFull(br, tmp4[:]); err != nil {
+		return nil, err
+	}
+	patternLen := binary.BigEndian.Uint32(tmp4[:])
+
+	// FG: mode (1 byte) + packedLen (4 bytes)
+	modeFG, err := br.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(br, tmp4[:]); err != nil {
+		return nil, err
+	}
+	fgPackedLen := binary.BigEndian.Uint32(tmp4[:])
+
+	// BG: mode (1 byte) + packedLen (4 bytes)
+	modeBG, err := br.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(br, tmp4[:]); err != nil {
+		return nil, err
+	}
+	bgPackedLen := binary.BigEndian.Uint32(tmp4[:])
+
+	// compute total size of the channel segment:
+	// blockCount(4) + sizeLen(4) + sizeBytes + typeLen(4) + typeBytes +
+	// patternLen(4) + patternBytes + FG(mode+len+bytes) + BG(mode+len+bytes)
+	total := 4 + 4 + int(sizeStreamLen) + 4 + int(typeStreamLen) + 4 + int(patternLen) + 1 + 4 + int(fgPackedLen) + 1 + 4 + int(bgPackedLen)
+	if total <= 0 || total > 1<<30 {
+		return nil, fmt.Errorf(
+			"readChannelSegment: absurd channel segment size %d (size=%d type=%d pattern=%d fg=%d bg=%d)",
+			total, sizeStreamLen, typeStreamLen, patternLen, fgPackedLen, bgPackedLen,
+		)
+	}
+	buf := make([]byte, total)
+	pos := 0
+
+	// write blockCount
+	binary.BigEndian.PutUint32(buf[pos:pos+4], blockCount)
+	pos += 4
+
+	// write sizeStreamLen and sizeBytes
+	binary.BigEndian.PutUint32(buf[pos:pos+4], sizeStreamLen)
+	pos += 4
+	if sizeStreamLen > 0 {
+		next := pos + int(sizeStreamLen)
+		if next < pos || next > len(buf) {
+			return nil, fmt.Errorf("readChannelSegment: inconsistent sizeStreamLen %d (buf=%d,pos=%d)", sizeStreamLen, len(buf), pos)
+		}
+		if _, err := io.ReadFull(br, buf[pos:next]); err != nil {
+			return nil, err
+		}
+		pos = next
+	}
+
+	// write typeStreamLen and typeBytes
+	binary.BigEndian.PutUint32(buf[pos:pos+4], typeStreamLen)
+	pos += 4
+	if typeStreamLen > 0 {
+		next := pos + int(typeStreamLen)
+		if next < pos || next > len(buf) {
+			return nil, fmt.Errorf("readChannelSegment: inconsistent typeStreamLen %d (buf=%d,pos=%d)", typeStreamLen, len(buf), pos)
+		}
+		if _, err := io.ReadFull(br, buf[pos:next]); err != nil {
+			return nil, err
+		}
+		pos = next
+	}
+
+	// write patternLen and patternBytes
+	binary.BigEndian.PutUint32(buf[pos:pos+4], patternLen)
+	pos += 4
+	if patternLen > 0 {
+		next := pos + int(patternLen)
+		if next < pos || next > len(buf) {
+			return nil, fmt.Errorf("readChannelSegment: inconsistent patternLen %d (buf=%d,pos=%d)", patternLen, len(buf), pos)
+		}
+		if _, err := io.ReadFull(br, buf[pos:next]); err != nil {
+			return nil, err
+		}
+		pos = next
+	}
+
+	// write FG mode, packedLen and packed bytes
+	buf[pos] = modeFG
+	pos++
+	binary.BigEndian.PutUint32(buf[pos:pos+4], fgPackedLen)
+	pos += 4
+	if fgPackedLen > 0 {
+		next := pos + int(fgPackedLen)
+		if next < pos || next > len(buf) {
+			return nil, fmt.Errorf("readChannelSegment: inconsistent fgPackedLen %d (buf=%d,pos=%d)", fgPackedLen, len(buf), pos)
+		}
+		if _, err := io.ReadFull(br, buf[pos:next]); err != nil {
+			return nil, err
+		}
+		pos = next
+	}
+
+	// write BG mode, packedLen and packed bytes
+	buf[pos] = modeBG
+	pos++
+	binary.BigEndian.PutUint32(buf[pos:pos+4], bgPackedLen)
+	pos += 4
+	if bgPackedLen > 0 {
+		next := pos + int(bgPackedLen)
+		if next < pos || next > len(buf) {
+			return nil, fmt.Errorf("readChannelSegment: inconsistent bgPackedLen %d (buf=%d,pos=%d)", bgPackedLen, len(buf), pos)
+		}
+		if _, err := io.ReadFull(br, buf[pos:next]); err != nil {
+			return nil, err
+		}
+		pos = next
+	}
+
+	return buf, nil
+}
+
 // decodeChannel decodes one channel stream into a planar buffer of size imgW x imgH.
 func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 	var blockCount uint32
@@ -603,6 +861,16 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 	}
 	sizeBR := NewBitReader(sizeBytes)
 
+	var typeStreamLen uint32
+	if err := binary.Read(br, binary.BigEndian, &typeStreamLen); err != nil {
+		return nil, err
+	}
+	typeBytes := make([]byte, typeStreamLen)
+	if _, err := io.ReadFull(br, typeBytes); err != nil {
+		return nil, err
+	}
+	typeBR := NewBitReader(typeBytes)
+
 	var patternLen uint32
 	if err := binary.Read(br, binary.BigEndian, &patternLen); err != nil {
 		return nil, err
@@ -612,6 +880,88 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 		return nil, err
 	}
 	patternBR := NewBitReader(patternBytes)
+
+	// FG: read mode and decode accordingly
+	modeFG, err := br.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	var fgVals []uint8
+	var fgCount32 uint32
+	if modeFG == 0 {
+		// delta-coded via DeltaPackBytes/DeltaUnpackBytes
+		var packedLen uint32
+		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+			return nil, err
+		}
+		packed := make([]byte, packedLen)
+		if _, err := io.ReadFull(br, packed); err != nil {
+			return nil, err
+		}
+		fgVals, err = DeltaUnpackBytes(packed)
+		if err != nil {
+			return nil, err
+		}
+		fgCount32 = uint32(len(fgVals))
+	} else {
+		// packed with PackBytes
+		var packedLen uint32
+		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+			return nil, err
+		}
+		packed := make([]byte, packedLen)
+		if _, err := io.ReadFull(br, packed); err != nil {
+			return nil, err
+		}
+		fgVals, err = DeltaUnpackBytes(packed)
+		if err != nil {
+			return nil, err
+		}
+		fgCount32 = uint32(len(fgVals))
+	}
+
+	// BG: read mode and decode accordingly
+	modeBG, err := br.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	var bgVals []uint8
+	var bgCount32 uint32
+	if modeBG == 0 {
+		// delta-coded via DeltaPackBytes/DeltaUnpackBytes
+		var packedLen uint32
+		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+			return nil, err
+		}
+		packed := make([]byte, packedLen)
+		if _, err := io.ReadFull(br, packed); err != nil {
+			return nil, err
+		}
+		bgVals, err = DeltaUnpackBytes(packed)
+		if err != nil {
+			return nil, err
+		}
+		bgCount32 = uint32(len(bgVals))
+	} else {
+		// packed with PackBytes
+		var packedLen uint32
+		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+			return nil, err
+		}
+		packed := make([]byte, packedLen)
+		if _, err := io.ReadFull(br, packed); err != nil {
+			return nil, err
+		}
+		bgVals, err = DeltaUnpackBytes(packed)
+		if err != nil {
+			return nil, err
+		}
+		bgCount32 = uint32(len(bgVals))
+	}
+
+	if fgCount32 != blockCount || bgCount32 != blockCount {
+		return nil, fmt.Errorf("color count mismatch: fg=%d bg=%d blocks=%d", fgCount32, bgCount32, blockCount)
+	}
 
 	// reconstruct the block geometry and fill the plane
 	plane := make([]uint8, imgW*imgH)
@@ -635,6 +985,8 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 
 	blockIndex := 0
 	macroIndex := 0
+	fgIndex := 0
+	bgIndex := 0
 
 	// main macroBlock x macroBlock area
 	for my := 0; my < fullH; my += macroBlock {
@@ -643,36 +995,36 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 				return nil, fmt.Errorf("unexpected end of blocks in main area")
 			}
 			if useMacro && macroBig[macroIndex] {
-				// macroBlock: read FG and BG and use full pattern
-				var fg, bg uint8
-				if err := binary.Read(br, binary.BigEndian, &fg); err != nil {
+				// macroBlock: read one type bit, FG and BG from arrays, use full pattern
+				bitType, err := typeBR.ReadBit()
+				if err != nil {
 					return nil, err
 				}
-				if err := binary.Read(br, binary.BigEndian, &bg); err != nil {
-					return nil, err
-				}
+				_ = bitType // always true for macro blocks
+				fg := fgVals[fgIndex]
+				bg := bgVals[bgIndex]
+				fgIndex++
+				bgIndex++
 				if err := drawBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, patternBR, fg, bg); err != nil {
 					return nil, err
 				}
 				blockIndex++
 			} else {
-				// grid of smallBlock blocks:
-				// - if smallBlock == 1: each block reads only FG and is filled solid
-				// - if smallBlock > 1: each block reads FG+BG and uses pattern bits
+				// grid of smallBlock x smallBlock blocks covering the macroBlock area
 				for by := 0; by < macroBlock; by += smallBlock {
 					for bx := 0; bx < macroBlock; bx += smallBlock {
 						if blockIndex >= int(blockCount) {
 							return nil, fmt.Errorf("unexpected end of blocks in macro grid")
 						}
-						var fg uint8
-						if err := binary.Read(br, binary.BigEndian, &fg); err != nil {
+						bitType, err := typeBR.ReadBit()
+						if err != nil {
 							return nil, err
 						}
-						if smallBlock > 1 {
-							var bg uint8
-							if err := binary.Read(br, binary.BigEndian, &bg); err != nil {
-								return nil, err
-							}
+						fg := fgVals[fgIndex]
+						bg := bgVals[bgIndex]
+						fgIndex++
+						bgIndex++
+						if bitType {
 							if err := drawBlockPlane(plane, imgW, mx+bx, my+by, smallBlock, smallBlock, patternBR, fg, bg); err != nil {
 								return nil, err
 							}
@@ -695,15 +1047,15 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 			if blockIndex >= int(blockCount) {
 				return nil, fmt.Errorf("unexpected end of blocks in right stripe")
 			}
-			var fg uint8
-			if err := binary.Read(br, binary.BigEndian, &fg); err != nil {
+			bitType, err := typeBR.ReadBit()
+			if err != nil {
 				return nil, err
 			}
-			if smallBlock > 1 {
-				var bg uint8
-				if err := binary.Read(br, binary.BigEndian, &bg); err != nil {
-					return nil, err
-				}
+			fg := fgVals[fgIndex]
+			bg := bgVals[bgIndex]
+			fgIndex++
+			bgIndex++
+			if bitType {
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, patternBR, fg, bg); err != nil {
 					return nil, err
 				}
@@ -721,15 +1073,15 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 			if blockIndex >= int(blockCount) {
 				return nil, fmt.Errorf("unexpected end of blocks in bottom stripe")
 			}
-			var fg uint8
-			if err := binary.Read(br, binary.BigEndian, &fg); err != nil {
+			bitType, err := typeBR.ReadBit()
+			if err != nil {
 				return nil, err
 			}
-			if smallBlock > 1 {
-				var bg uint8
-				if err := binary.Read(br, binary.BigEndian, &bg); err != nil {
-					return nil, err
-				}
+			fg := fgVals[fgIndex]
+			bg := bgVals[bgIndex]
+			fgIndex++
+			bgIndex++
+			if bitType {
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, patternBR, fg, bg); err != nil {
 					return nil, err
 				}
@@ -740,6 +1092,9 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 			}
 			blockIndex++
 		}
+	}
+	if fgIndex != int(blockCount) || bgIndex != int(blockCount) {
+		return nil, fmt.Errorf("color stream mismatch: used fg=%d bg=%d blocks=%d", fgIndex, bgIndex, blockCount)
 	}
 	if blockIndex != int(blockCount) {
 		return nil, fmt.Errorf("block count mismatch: used %d of %d", blockIndex, blockCount)
@@ -796,7 +1151,8 @@ func Decode(compData []byte) (image.Image, error) {
 			macroBlock, smallBlock)
 	}
 
-	// decode three independent channels: Y, Cb, Cr
+	// decode three channels sequentially from the shared stream:
+	// Y, then Cb, then Cr in the same order they were written.
 	yPlane, err := decodeChannel(br, imgW, imgH)
 	if err != nil {
 		return nil, err
@@ -810,25 +1166,50 @@ func Decode(compData []byte) (image.Image, error) {
 		return nil, err
 	}
 
-	// combine into RGBA
+	// combine into RGBA (fast path: write directly into Pix)
 	dst := image.NewRGBA(image.Rect(0, 0, imgW, imgH))
+	pix := dst.Pix
+	stride := dst.Stride
 	for y := 0; y < imgH; y++ {
+		rowOff := y * stride
+		baseIdx := y * imgW
 		for x := 0; x < imgW; x++ {
-			idx := y*imgW + x
-			Y := yPlane[idx]
-			Cb := cbPlane[idx]
-			Cr := crPlane[idx]
-			rgb := yCbCrToRGB(yuv{
-				Y:  int16(Y),
-				Cb: int16(Cb),
-				Cr: int16(Cr),
-			})
-			dst.Set(x, y, color.RGBA{rgb[0], rgb[1], rgb[2], 255})
+			idx := baseIdx + x
+			Y := float64(yPlane[idx])
+			Cb := float64(cbPlane[idx]) - 128.0
+			Cr := float64(crPlane[idx]) - 128.0
+			R := Y + 1.402*Cr
+			G := Y - 0.344136*Cb - 0.714136*Cr
+			B := Y + 1.772*Cb
+
+			// clamp to [0,255]
+			if R < 0 {
+				R = 0
+			} else if R > 255 {
+				R = 255
+			}
+			if G < 0 {
+				G = 0
+			} else if G > 255 {
+				G = 255
+			}
+			if B < 0 {
+				B = 0
+			} else if B > 255 {
+				B = 255
+			}
+
+			o := rowOff + x*4
+			pix[o+0] = uint8(R)
+			pix[o+1] = uint8(G)
+			pix[o+2] = uint8(B)
+			pix[o+3] = 255
 		}
 	}
 
-	// постпроцесс (градиенты в узлах + лёгкий деблокинг)
+	// Post-process: gradient smoothing at junctions + light deblocking.
 	smoothed := smoothBlocks(dst)
+
 	return smoothed, nil
 }
 
@@ -852,8 +1233,23 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 	const junctionLumaSpread int32 = 32
 	const lumaSimThreshold int32 = 8
 
-	similar := func(a, b color.RGBA) bool {
-		da := luma(a) - luma(b)
+	minX := b.Min.X
+	minY := b.Min.Y
+	stride := img.Stride
+	pix := img.Pix
+
+	// helper to compute luma from 8-bit RGB directly
+	luma8 := func(r, g, b uint8) int32 {
+		rr := int32(r)
+		gg := int32(g)
+		bb := int32(b)
+		// Integer approximation of ITU-R BT.601:
+		// Y ≈ 0.299 R + 0.587 G + 0.114 B
+		return (299*rr + 587*gg + 114*bb) / 1000
+	}
+
+	similar := func(r1, g1, b1, a1, r2, g2, b2, a2 uint8) bool {
+		da := luma8(r1, g1, b1) - luma8(r2, g2, b2)
 		if da < 0 {
 			da = -da
 		}
@@ -867,15 +1263,20 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 	for y := b.Min.Y + smallBlock; y < b.Max.Y; y += smallBlock {
 		for x := b.Min.X + smallBlock; x < b.Max.X; x += smallBlock {
 			// four corners around the junction
-			c00 := img.RGBAAt(x-1, y-1) // top-left
-			c10 := img.RGBAAt(x, y-1)   // top-right
-			c01 := img.RGBAAt(x-1, y)   // bottom-left
-			c11 := img.RGBAAt(x, y)     // bottom-right
+			idx00 := (y-1-minY)*stride + (x-1-minX)*4 // top-left
+			idx10 := (y-1-minY)*stride + (x-minX)*4   // top-right
+			idx01 := (y-minY)*stride + (x-1-minX)*4   // bottom-left
+			idx11 := (y-minY)*stride + (x-minX)*4     // bottom-right
 
-			l00 := luma(c00)
-			l10 := luma(c10)
-			l01 := luma(c01)
-			l11 := luma(c11)
+			r00, g00, b00, a00 := pix[idx00+0], pix[idx00+1], pix[idx00+2], pix[idx00+3]
+			r10, g10, b10, a10 := pix[idx10+0], pix[idx10+1], pix[idx10+2], pix[idx10+3]
+			r01, g01, b01, a01 := pix[idx01+0], pix[idx01+1], pix[idx01+2], pix[idx01+3]
+			r11, g11, b11, a11 := pix[idx11+0], pix[idx11+1], pix[idx11+2], pix[idx11+3]
+
+			l00 := luma8(r00, g00, b00)
+			l10 := luma8(r10, g10, b10)
+			l01 := luma8(r01, g01, b01)
+			l11 := luma8(r11, g11, b11)
 
 			minL, maxL := l00, l00
 			for _, v := range []int32{l10, l01, l11} {
@@ -894,9 +1295,11 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 			// grow small rectangle around the junction while colors remain similar
 			L := 0
 			for i := 1; i <= maxRadius && x-i >= b.Min.X; i++ {
-				up := img.RGBAAt(x-i, y-1)
-				down := img.RGBAAt(x-i, y)
-				if !similar(up, c00) || !similar(down, c01) {
+				idxUp := (y-1-minY)*stride + (x-i-minX)*4
+				idxDown := (y-minY)*stride + (x-i-minX)*4
+				rUp, gUp, bUp, aUp := pix[idxUp+0], pix[idxUp+1], pix[idxUp+2], pix[idxUp+3]
+				rDown, gDown, bDown, aDown := pix[idxDown+0], pix[idxDown+1], pix[idxDown+2], pix[idxDown+3]
+				if !similar(rUp, gUp, bUp, aUp, r00, g00, b00, a00) || !similar(rDown, gDown, bDown, aDown, r01, g01, b01, a01) {
 					break
 				}
 				L = i
@@ -904,9 +1307,11 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 
 			R := 0
 			for i := 1; i <= maxRadius && x-1+i < b.Max.X; i++ {
-				up := img.RGBAAt(x-1+i, y-1)
-				down := img.RGBAAt(x-1+i, y)
-				if !similar(up, c10) || !similar(down, c11) {
+				idxUp := (y-1-minY)*stride + (x-1+i-minX)*4
+				idxDown := (y-minY)*stride + (x-1+i-minX)*4
+				rUp, gUp, bUp, aUp := pix[idxUp+0], pix[idxUp+1], pix[idxUp+2], pix[idxUp+3]
+				rDown, gDown, bDown, aDown := pix[idxDown+0], pix[idxDown+1], pix[idxDown+2], pix[idxDown+3]
+				if !similar(rUp, gUp, bUp, aUp, r10, g10, b10, a10) || !similar(rDown, gDown, bDown, aDown, r11, g11, b11, a11) {
 					break
 				}
 				R = i
@@ -914,9 +1319,11 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 
 			U := 0
 			for i := 1; i <= maxRadius && y-i >= b.Min.Y; i++ {
-				left := img.RGBAAt(x-1, y-i)
-				right := img.RGBAAt(x, y-i)
-				if !similar(left, c00) || !similar(right, c10) {
+				idxLeft := (y-i-minY)*stride + (x-1-minX)*4
+				idxRight := (y-i-minY)*stride + (x-minX)*4
+				rLeft, gLeft, bLeft, aLeft := pix[idxLeft+0], pix[idxLeft+1], pix[idxLeft+2], pix[idxLeft+3]
+				rRight, gRight, bRight, aRight := pix[idxRight+0], pix[idxRight+1], pix[idxRight+2], pix[idxRight+3]
+				if !similar(rLeft, gLeft, bLeft, aLeft, r00, g00, b00, a00) || !similar(rRight, gRight, bRight, aRight, r10, g10, b10, a10) {
 					break
 				}
 				U = i
@@ -924,9 +1331,11 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 
 			D := 0
 			for i := 1; i <= maxRadius && y-1+i < b.Max.Y; i++ {
-				left := img.RGBAAt(x-1, y-1+i)
-				right := img.RGBAAt(x, y-1+i)
-				if !similar(left, c01) || !similar(right, c11) {
+				idxLeft := (y-1+i-minY)*stride + (x-1-minX)*4
+				idxRight := (y-1+i-minY)*stride + (x-minX)*4
+				rLeft, gLeft, bLeft, aLeft := pix[idxLeft+0], pix[idxLeft+1], pix[idxLeft+2], pix[idxLeft+3]
+				rRight, gRight, bRight, aRight := pix[idxRight+0], pix[idxRight+1], pix[idxRight+2], pix[idxRight+3]
+				if !similar(rLeft, gLeft, bLeft, aLeft, r01, g01, b01, a01) || !similar(rRight, gRight, bRight, aRight, r11, g11, b11, a11) {
 					break
 				}
 				D = i
@@ -948,16 +1357,12 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 				continue
 			}
 
-			r00, g00, b00, a00 := c00.R, c00.G, c00.B, c00.A
-			r10, g10, b10, a10 := c10.R, c10.G, c10.B, c10.A
-			r01, g01, b01, a01 := c01.R, c01.G, c01.B, c01.A
-			r11, g11, b11, a11 := c11.R, c11.G, c11.B, c11.A
-
 			width := rectMaxX - rectMinX
 			height := rectMaxY - rectMinY
 
 			for py := rectMinY; py <= rectMaxY; py++ {
 				v := float64(py-rectMinY) / float64(height)
+				rowOff := (py - minY) * stride
 				for px := rectMinX; px <= rectMaxX; px++ {
 					u := float64(px-rectMinX) / float64(width)
 
@@ -976,7 +1381,11 @@ func smoothJunctions(img *image.RGBA) *image.RGBA {
 					bc := lerp8(bTop, bBot, v)
 					a := lerp8(aTop, aBot, v)
 
-					img.SetRGBA(px, py, color.RGBA{r, g, bc, a})
+					idx := rowOff + (px-minX)*4
+					pix[idx+0] = r
+					pix[idx+1] = g
+					pix[idx+2] = bc
+					pix[idx+3] = a
 				}
 			}
 		}
@@ -996,23 +1405,46 @@ func smoothFlatAreas(src *image.RGBA) *image.RGBA {
 		return src
 	}
 
-	// start from a copy of the original
-	dst := image.NewRGBA(b)
-	copy(dst.Pix, src.Pix)
+	srcPix := src.Pix
+	stride := src.Stride
 
 	// threshold on luminance difference across a block boundary
 	// smaller values -> less smoothing
 	const boundaryLumaThreshold int32 = 10
 
+	// helper to compute luma from 8-bit RGB directly
+	luma8 := func(r, g, b uint8) int32 {
+		rr := int32(r)
+		gg := int32(g)
+		bb := int32(b)
+		// Integer approximation of ITU-R BT.601:
+		// Y ≈ 0.299 R + 0.587 G + 0.114 B
+		return (299*rr + 587*gg + 114*bb) / 1000
+	}
+
+	minX := b.Min.X
+	minY := b.Min.Y
+
 	// vertical block boundaries: x = k * smallBlock
 	for x := b.Min.X + smallBlock; x < b.Max.X; x += smallBlock {
+		xL := x - 1
 		for y := b.Min.Y; y < b.Max.Y; y++ {
-			// pixels immediately left and right of the boundary
-			cl := src.RGBAAt(x-1, y)
-			cr := src.RGBAAt(x, y)
+			rowOff := (y - minY) * stride
+			idxL := rowOff + (xL-minX)*4
+			idxR := rowOff + (x-minX)*4
 
-			lL := luma(cl)
-			lR := luma(cr)
+			rL := srcPix[idxL+0]
+			gL := srcPix[idxL+1]
+			bL := srcPix[idxL+2]
+			aL := srcPix[idxL+3]
+
+			rR := srcPix[idxR+0]
+			gR := srcPix[idxR+1]
+			bR := srcPix[idxR+2]
+			aR := srcPix[idxR+3]
+
+			lL := luma8(rL, gL, bL)
+			lR := luma8(rR, gR, bR)
 			d := lL - lR
 			if d < 0 {
 				d = -d
@@ -1020,50 +1452,73 @@ func smoothFlatAreas(src *image.RGBA) *image.RGBA {
 
 			// if the two sides are similar in luminance, slightly blur across the boundary
 			if d <= boundaryLumaThreshold {
-				r := uint8((uint16(cl.R) + uint16(cr.R)) / 2)
-				g := uint8((uint16(cl.G) + uint16(cr.G)) / 2)
-				bc := uint8((uint16(cl.B) + uint16(cr.B)) / 2)
-				a := uint8((uint16(cl.A) + uint16(cr.A)) / 2)
-				cAvg := color.RGBA{r, g, bc, a}
+				r := uint8((uint16(rL) + uint16(rR)) / 2)
+				g := uint8((uint16(gL) + uint16(gR)) / 2)
+				bc := uint8((uint16(bL) + uint16(bR)) / 2)
+				a := uint8((uint16(aL) + uint16(aR)) / 2)
 
-				dst.SetRGBA(x-1, y, cAvg)
-				dst.SetRGBA(x, y, cAvg)
+				srcPix[idxL+0] = r
+				srcPix[idxL+1] = g
+				srcPix[idxL+2] = bc
+				srcPix[idxL+3] = a
+
+				srcPix[idxR+0] = r
+				srcPix[idxR+1] = g
+				srcPix[idxR+2] = bc
+				srcPix[idxR+3] = a
 			}
 		}
 	}
 
 	// horizontal block boundaries: y = k * smallBlock
 	for y := b.Min.Y + smallBlock; y < b.Max.Y; y += smallBlock {
+		yT := y - 1
 		for x := b.Min.X; x < b.Max.X; x++ {
-			// pixels immediately above and below the boundary
-			ct := src.RGBAAt(x, y-1)
-			cb := src.RGBAAt(x, y)
+			colOff := (x - minX) * 4
+			idxT := (yT-minY)*stride + colOff
+			idxB := (y-minY)*stride + colOff
 
-			lT := luma(ct)
-			lB := luma(cb)
+			rT := srcPix[idxT+0]
+			gT := srcPix[idxT+1]
+			bT := srcPix[idxT+2]
+			aT := srcPix[idxT+3]
+
+			rB := srcPix[idxB+0]
+			gB := srcPix[idxB+1]
+			bB := srcPix[idxB+2]
+			aB := srcPix[idxB+3]
+
+			lT := luma8(rT, gT, bT)
+			lB := luma8(rB, gB, bB)
 			d := lT - lB
 			if d < 0 {
 				d = -d
 			}
 
 			if d <= boundaryLumaThreshold {
-				r := uint8((uint16(ct.R) + uint16(cb.R)) / 2)
-				g := uint8((uint16(ct.G) + uint16(cb.G)) / 2)
-				bc := uint8((uint16(ct.B) + uint16(cb.B)) / 2)
-				a := uint8((uint16(ct.A) + uint16(cb.A)) / 2)
-				cAvg := color.RGBA{r, g, bc, a}
+				r := uint8((uint16(rT) + uint16(rB)) / 2)
+				g := uint8((uint16(gT) + uint16(gB)) / 2)
+				bc := uint8((uint16(bT) + uint16(bB)) / 2)
+				a := uint8((uint16(aT) + uint16(aB)) / 2)
 
-				dst.SetRGBA(x, y-1, cAvg)
-				dst.SetRGBA(x, y, cAvg)
+				srcPix[idxT+0] = r
+				srcPix[idxT+1] = g
+				srcPix[idxT+2] = bc
+				srcPix[idxT+3] = a
+
+				srcPix[idxB+0] = r
+				srcPix[idxB+1] = g
+				srcPix[idxB+2] = bc
+				srcPix[idxB+3] = a
 			}
 		}
 	}
 
-	return dst
+	return src
 }
 
 // smoothBlocks runs both junction smoothing and light deblocking in a fixed order.
-// This keeps the post-process logic in one place for Decode.
+// This keeps the post-process logic in one place for Decode().
 func smoothBlocks(src *image.RGBA) *image.RGBA {
 	// first apply light deblocking along block boundaries,
 	// then apply gradient smoothing at block junctions.
@@ -1108,6 +1563,21 @@ func yCbCrToRGB(v yuv) [3]uint8 {
 	}
 
 	return [3]uint8{clip(R), clip(G), clip(B)}
+}
+
+// delta‑coding of an 8‑bit value on a 0..255 ring into int8 [-128..127]
+func encodeDelta8(prev, curr uint8) int8 {
+	diff := int16(curr) - int16(prev)
+	if diff < -128 {
+		diff += 256
+	} else if diff > 127 {
+		diff -= 256
+	}
+	return int8(diff)
+}
+
+func decodeDelta8(prev uint8, d int8) uint8 {
+	return uint8(int16(prev) + int16(d))
 }
 
 // --- ZSTD helpers ---
@@ -1157,4 +1627,109 @@ func luma(c color.Color) int32 {
 	// Integer approximation of ITU-R BT.601:
 	// Y ≈ 0.299 R + 0.587 G + 0.114 B
 	return (299*rr + 587*gg + 114*bb) / 1000
+}
+
+// bitsNeeded returns how many bits are required to represent v (0..255).
+
+func bitsNeeded(v int) int {
+	if v <= 0 {
+		return 1
+	}
+	bits := 0
+	for v > 0 {
+		bits++
+		v >>= 1
+	}
+	if bits > 8 {
+		return 8
+	}
+	return bits
+}
+
+// Global scale/bits for chroma-related packing (e.g. Cb/Cr).
+// packBits must be enough to represent the range [0 .. 255/packScale].
+const packScale = 1
+const packBits = 8 // bitsNeeded(255 / packScale) for current scale
+
+func init() {
+	// Safety check: ensure packBits is consistent with packScale.
+	expected := bitsNeeded(255 / packScale)
+	if expected != packBits {
+		panic(fmt.Sprintf("packBits (%d) mismatch bitsNeeded(255/packScale)=%d", packBits, expected))
+	}
+}
+
+// DeltaPackBytes encodes a byte slice using circular delta coding on 0..255.
+// Layout:
+//
+//	[0..3]  = totalLen (uint32, BigEndian) — original length
+//	[4]     = first byte (if totalLen > 0)
+//	[5..]   = (totalLen-1) delta bytes (encodeDelta8(prev, curr))
+func DeltaPackBytes(src []byte) ([]byte, error) {
+	n := len(src)
+
+	// Always allocate header (4 bytes) + n payload bytes.
+	// For n == 0, this yields a 4-byte slice with just the length header.
+	out := make([]byte, 4+n)
+
+	// total length
+	binary.BigEndian.PutUint32(out[:4], uint32(n))
+	if n == 0 {
+		return out, nil
+	}
+
+	// first byte as-is
+	out[4] = src[0]
+
+	// remaining bytes as deltas
+	prev := src[0]
+	for i := 1; i < n; i++ {
+		d := encodeDelta8(prev, src[i])
+		out[4+i] = byte(d)
+		prev = src[i]
+	}
+
+	return out, nil
+}
+
+// DeltaUnpackBytes decodes a slice produced by DeltaPackBytes.
+func DeltaUnpackBytes(packed []byte) ([]byte, error) {
+	if len(packed) < 4 {
+		return nil, fmt.Errorf("delta packed data too short")
+	}
+
+	totalLen := binary.BigEndian.Uint32(packed[0:4])
+	if totalLen == 0 {
+		return []byte{}, nil
+	}
+
+	// need at least one byte for the first value
+	if len(packed) < 4+1 {
+		return nil, fmt.Errorf("delta packed data truncated (no first byte)")
+	}
+
+	dst := make([]byte, totalLen)
+	pos := 4
+
+	// first byte
+	first := packed[pos]
+	dst[0] = first
+	pos++
+
+	// remaining deltas
+	expectedDeltaCount := int(totalLen) - 1
+	if len(packed) < pos+expectedDeltaCount {
+		return nil, fmt.Errorf("delta packed data truncated (missing deltas)")
+	}
+
+	prev := first
+	for i := 1; i < int(totalLen); i++ {
+		d := int8(packed[pos])
+		pos++
+		val := decodeDelta8(prev, d)
+		dst[i] = val
+		prev = val
+	}
+
+	return dst, nil
 }

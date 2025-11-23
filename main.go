@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -29,7 +30,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, "decode error:", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Decoded %s → %s\n", inputPath, base+".png")
 		return
 	}
 
@@ -53,23 +53,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "encode error:", err)
 		os.Exit(1)
 	}
-	info, err := os.Stat(outPath)
-	if err != nil {
-		fmt.Printf("Encoded %s (quality=%d) → %s\n", inputPath, quality, outPath)
-	} else {
-		size := info.Size()
-		var sizeStr string
-		if size < 1_000_000 {
-			sizeStr = fmt.Sprintf("%.2f KB", float64(size)/1024)
-		} else {
-			sizeStr = fmt.Sprintf("%.2f MB", float64(size)/1024/1024)
-		}
-		fmt.Printf("Encoded %s (quality=%d, size=%s) → %s\n",
-			inputPath, quality, sizeStr, outPath)
-	}
 }
 
 func encodeToBabe(inPath, outPath string, quality int) error {
+	info, err := os.Stat(inPath)
+	if err != nil {
+		return err
+	}
+	inSize := info.Size()
+
 	in, err := os.Open(inPath)
 	if err != nil {
 		return err
@@ -81,10 +73,12 @@ func encodeToBabe(inPath, outPath string, quality int) error {
 		return err
 	}
 
+	start := time.Now()
 	enc, err := Encode(img, quality)
 	if err != nil {
 		return err
 	}
+	finish := time.Since(start)
 
 	out, err := os.Create(outPath)
 	if err != nil {
@@ -96,10 +90,33 @@ func encodeToBabe(inPath, outPath string, quality int) error {
 		return err
 	}
 
+	encSize := int64(len(enc))
+	ratio := float64(encSize) / float64(inSize)
+
+	formatSize := func(size int64) string {
+		if size < 1024*1024 {
+			return fmt.Sprintf("%.2f KB", float64(size)/1024)
+		}
+		return fmt.Sprintf("%.2f MB", float64(size)/(1024*1024))
+	}
+
+	fmt.Printf("%s (%s) → %s (%s)\n",
+		inPath,
+		formatSize(inSize),
+		outPath,
+		formatSize(encSize),
+	)
+	fmt.Printf("quality=%d, ratio=%.3f, time=%s\n",
+		quality,
+		ratio,
+		finish,
+	)
+
 	return nil
 }
 
 func decodeBabe(inPath, outPath string) error {
+
 	in, err := os.Open(inPath)
 	if err != nil {
 		return err
@@ -111,10 +128,14 @@ func decodeBabe(inPath, outPath string) error {
 		return err
 	}
 
+	compSize := len(compData)
+
+	start := time.Now()
 	dec, err := Decode(compData)
 	if err != nil {
 		return err
 	}
+	finish := time.Since(start)
 
 	out, err := os.Create(outPath)
 	if err != nil {
@@ -125,6 +146,31 @@ func decodeBabe(inPath, outPath string) error {
 	if err := png.Encode(out, dec); err != nil {
 		return err
 	}
+
+	info, err := out.Stat()
+	if err != nil {
+		return err
+	}
+	outSize := info.Size()
+	ratio := float64(outSize) / float64(compSize)
+
+	formatSize := func(size int64) string {
+		if size < 1024*1024 {
+			return fmt.Sprintf("%.2f KB", float64(size)/1024)
+		}
+		return fmt.Sprintf("%.2f MB", float64(size)/(1024*1024))
+	}
+
+	fmt.Printf("%s (%s) → %s (%s)\n",
+		inPath,
+		formatSize(int64(compSize)),
+		outPath,
+		formatSize(outSize),
+	)
+	fmt.Printf("ratio=%.3f, time=%s\n",
+		ratio,
+		finish,
+	)
 
 	return nil
 }
