@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
 	"github.com/xfmoulet/qoi"
 )
 
@@ -66,74 +67,74 @@ func BenchmarkJPEG(b *testing.B) {
 }
 
 func BenchmarkBABE(b *testing.B) {
-    img := loadTestImage(b)
-    cpus := runtime.NumCPU()
-    procs := runtime.GOMAXPROCS(0)
-    gor := runtime.NumGoroutine()
-    b.Logf("cpus=%d gomaxprocs=%d goroutines=%d", cpus, procs, gor)
+	img := loadTestImage(b)
+	cpus := runtime.NumCPU()
+	procs := runtime.GOMAXPROCS(0)
+	gor := runtime.NumGoroutine()
+	b.Logf("cpus=%d gomaxprocs=%d goroutines=%d", cpus, procs, gor)
 
-    b.ResetTimer()
+	b.ResetTimer()
 
-    for i := 0; i < b.N; i++ {
-        // Encode
-        startEnc := time.Now()
-        enc, err := Encode(img, 60)
-        if err != nil {
-            b.Fatalf("encode failed: %v", err)
-        }
-        encTime := time.Since(startEnc)
-        encSize := len(enc)
-        _ = encSize
+	for i := 0; i < b.N; i++ {
+		// Encode
+		startEnc := time.Now()
+		enc, err := Encode(img, 80)
+		if err != nil {
+			b.Fatalf("encode failed: %v", err)
+		}
+		encTime := time.Since(startEnc)
+		encSize := len(enc)
+		_ = encSize
 
-        // Decode
-        startDec := time.Now()
-        _, err = Decode(enc)
-        if err != nil {
-            b.Fatalf("decode failed: %v", err)
-        }
-        decTime := time.Since(startDec)
+		// Decode
+		startDec := time.Now()
+		_, err = Decode(enc)
+		if err != nil {
+			b.Fatalf("decode failed: %v", err)
+		}
+		decTime := time.Since(startDec)
 
-        // Record encoded size in benchmark output
-        b.Logf("encode=%v decode=%v size=%d bytes", encTime, decTime, len(enc))
+		// Record encoded size in benchmark output
+		b.Logf("encode=%v decode=%v size=%d bytes", encTime, decTime, len(enc))
 
-        // Prevent compiler optimization
-        if encTime == 0 || decTime == 0 {
-            b.Fatalf("unexpected zero time")
-        }
-    }
+		// Prevent compiler optimization
+		if encTime == 0 || decTime == 0 {
+			b.Fatalf("unexpected zero time")
+		}
+	}
 }
 
 func BenchmarkQOI(b *testing.B) {
-    img := loadTestImage(b)
-    cpus := runtime.NumCPU()
-    procs := runtime.GOMAXPROCS(0)
-    gor := runtime.NumGoroutine()
-    b.Logf("cpus=%d gomaxprocs=%d goroutines=%d", cpus, procs, gor)
+	img := loadTestImage(b)
+	cpus := runtime.NumCPU()
+	procs := runtime.GOMAXPROCS(0)
+	gor := runtime.NumGoroutine()
+	b.Logf("cpus=%d gomaxprocs=%d goroutines=%d", cpus, procs, gor)
 
-    b.ResetTimer()
+	b.ResetTimer()
 
-    for i := 0; i < b.N; i++ {
-        // Encode
-        startEnc := time.Now()
-        var buf bytes.Buffer
-        if err := qoi.Encode(&buf, img); err != nil {
-            b.Fatalf("qoi encode failed: %v", err)
-        }
-        enc := buf.Bytes()
-        encTime := time.Since(startEnc)
+	for i := 0; i < b.N; i++ {
+		// Encode
+		startEnc := time.Now()
+		var buf bytes.Buffer
+		if err := qoi.Encode(&buf, img); err != nil {
+			b.Fatalf("qoi encode failed: %v", err)
+		}
+		enc := buf.Bytes()
+		encTime := time.Since(startEnc)
 
-        // Decode
-        startDec := time.Now()
-        _, err := qoi.Decode(bytes.NewReader(enc))
-        if err != nil {
-            b.Fatalf("qoi decode failed: %v", err)
-        }
-        decTime := time.Since(startDec)
+		// Decode
+		startDec := time.Now()
+		_, err := qoi.Decode(bytes.NewReader(enc))
+		if err != nil {
+			b.Fatalf("qoi decode failed: %v", err)
+		}
+		decTime := time.Since(startDec)
 
-        b.Logf("encode=%v decode=%v size=%d bytes", encTime, decTime, len(enc))
+		b.Logf("encode=%v decode=%v size=%d bytes", encTime, decTime, len(enc))
 
-        if encTime == 0 || decTime == 0 {
-            b.Fatalf("unexpected zero time")
-        }
-    }
+		if encTime == 0 || decTime == 0 {
+			b.Fatalf("unexpected zero time")
+		}
+	}
 }

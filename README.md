@@ -134,14 +134,12 @@ Format details, quality tuning, and performance optimizations are still evolving
 
 Approximate performance on Apple M3 (single‑threaded encode/decode):
 
-| Metric | JPEG | BABE | QOI |
-|--------|------|------|------|
-| **Encode time** | 1.22 s | 0.59 s | 0.86 s |
-| **Decode time** | 0.45 s | 0.17–0.20 s | 0.27 s |
-| **Total (encode+decode)** | 1.67 s | ~0.77 s | 1.13 s |
-| **Output size** | 10.6 MB | 18.2 MB | 60.6 MB |
-
-These numbers are based on internal benchmark tests and may vary depending on hardware and input images.
+| Metric | JPEG (q=80) | BABE (q=80) | QOI |
+|--------|-------------|-------------|------|
+| **Encode time** | 1.10 s | 1.00 s | 0.86 s |
+| **Decode time** | 0.44 s | 0.31 s | 0.31 s |
+| **Total (encode+decode)** | 1.54 s | 1.31 s | 1.17 s |
+| **Output size** | 10.6 MB | 28.9 MB | 60.6 MB |
 
 ## License
 
