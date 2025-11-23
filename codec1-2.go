@@ -469,7 +469,50 @@ func encodeBlockPlane(plane []uint8, stride, x0, y0, bw, bh int, pw *BitWriter) 
 // its own block count, size stream, pattern stream, and per-block FG/BG levels.
 func encodeChannel(plane []uint8, stride, w4, h4, fullW, fullH int, useMacro bool) (uint32, []byte, []byte, []byte, []uint8, []uint8, error) {
 	// macro-block decision bits (only for main fullW x fullH area)
+	// Precompute an upper bound on the total block count so we can
+	// preallocate FG/BG slices and avoid repeated growth.
+	macroGroupsX := 0
+	macroGroupsY := 0
+	if macroBlock > 0 {
+		macroGroupsX = fullW / macroBlock
+		macroGroupsY = fullH / macroBlock
+	}
+	macroGroupCount := macroGroupsX * macroGroupsY
+
+	// worst-case: every macro-block is split into a full grid of small blocks
+	mbs := 1
+	if smallBlock > 0 {
+		mbs = macroBlock / smallBlock
+		if mbs < 1 {
+			mbs = 1
+		}
+	}
+	worstMainBlocks := macroGroupCount * mbs * mbs
+
+	// right stripe: only small blocks
+	rightWidth := w4 - fullW
+	rightBlocks := 0
+	if rightWidth > 0 && smallBlock > 0 {
+		rightBlocks = (fullH / smallBlock) * (rightWidth / smallBlock)
+	}
+
+	// bottom stripe (including bottom-right corner): only small blocks
+	bottomHeight := h4 - fullH
+	bottomBlocks := 0
+	if bottomHeight > 0 && smallBlock > 0 {
+		bottomBlocks = (bottomHeight / smallBlock) * (w4 / smallBlock)
+	}
+
+	worstBlockCount := worstMainBlocks + rightBlocks + bottomBlocks
+	if worstBlockCount < 0 {
+		worstBlockCount = 0
+	}
+
 	var macroUseBig []bool
+	if macroGroupCount > 0 {
+		macroUseBig = make([]bool, 0, macroGroupCount)
+	}
+
 	var blockCount uint32
 
 	var sizeBuf bytes.Buffer
@@ -482,6 +525,10 @@ func encodeChannel(plane []uint8, stride, w4, h4, fullW, fullH int, useMacro boo
 
 	var fgVals []uint8
 	var bgVals []uint8
+	if worstBlockCount > 0 {
+		fgVals = make([]uint8, 0, worstBlockCount)
+		bgVals = make([]uint8, 0, worstBlockCount)
+	}
 
 	height := h4
 
@@ -1752,6 +1799,11 @@ func smoothFlatAreas(src *image.RGBA) *image.RGBA {
 // smoothBlocks runs both junction smoothing and light deblocking in a fixed order.
 // This keeps the post-process logic in one place for Decode().
 func smoothBlocks(src *image.RGBA) *image.RGBA {
+	// If we are operating at the finest granularity (1x1 blocks),
+	// there are no visible block boundaries to smooth.
+	if smallBlock <= 1 {
+		return src
+	}
 	// first apply light deblocking along block boundaries,
 	// then apply gradient smoothing at block junctions.
 	return smoothJunctions(smoothFlatAreas(src))
