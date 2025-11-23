@@ -84,7 +84,7 @@ input.babe
 
 Default quality is **10**.
 
-Specify a custom quality (0–29):
+Specify a custom quality (0–100):
 
 ```
 babe input.jpg 5
