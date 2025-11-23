@@ -15,6 +15,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	"io"
+	"runtime"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -165,24 +166,54 @@ func extractYCbCrPlanes(img image.Image) ([]uint8, []uint8, []uint8, int, int) {
 	b := img.Bounds()
 	w := b.Dx()
 	h := b.Dy()
+
 	yPlane := make([]uint8, w*h)
 	cbPlane := make([]uint8, w*h)
 	crPlane := make([]uint8, w*h)
 
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			c := img.At(b.Min.X+x, b.Min.Y+y)
-			r16, g16, b16, _ := c.RGBA()
-			r8 := uint8(r16 >> 8)
-			g8 := uint8(g16 >> 8)
-			b8 := uint8(b16 >> 8)
-			ycc := rgbToYCbCr(r8, g8, b8)
-			idx := y*w + x
-			yPlane[idx] = uint8(ycc.Y)
-			cbPlane[idx] = uint8(ycc.Cb)
-			crPlane[idx] = uint8(ycc.Cr)
-		}
+	// Parallelize over scanlines to speed up the expensive At/RGBA work.
+	workers := runtime.NumCPU()
+	if workers > h {
+		workers = h
 	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	rowsPerWorker := (h + workers - 1) / workers
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		y0 := i * rowsPerWorker
+		if y0 >= h {
+			break
+		}
+		y1 := y0 + rowsPerWorker
+		if y1 > h {
+			y1 = h
+		}
+
+		wg.Add(1)
+		go func(yStart, yEnd int) {
+			defer wg.Done()
+			for y := yStart; y < yEnd; y++ {
+				baseIdx := y * w
+				for x := 0; x < w; x++ {
+					c := img.At(b.Min.X+x, b.Min.Y+y)
+					r16, g16, b16, _ := c.RGBA()
+					r8 := uint8(r16 >> 8)
+					g8 := uint8(g16 >> 8)
+					b8 := uint8(b16 >> 8)
+					ycc := rgbToYCbCr(r8, g8, b8)
+					idx := baseIdx + x
+					yPlane[idx] = uint8(ycc.Y)
+					cbPlane[idx] = uint8(ycc.Cb)
+					crPlane[idx] = uint8(ycc.Cr)
+				}
+			}
+		}(y0, y1)
+	}
+	wg.Wait()
 
 	return yPlane, cbPlane, crPlane, w, h
 }
@@ -279,7 +310,7 @@ func encodeBlockPlane(plane []uint8, stride, x0, y0, bw, bh int, pw *BitWriter) 
 	for yy := 0; yy < bh; yy++ {
 		for xx := 0; xx < bw; xx++ {
 			idx := (y0+yy)*stride + (x0 + xx)
-			if idx < 0 || idx >= len(plane) {
+			if idx >= len(plane) {
 				return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
 			}
 			val := plane[idx]
@@ -304,7 +335,7 @@ func encodeBlockPlane(plane []uint8, stride, x0, y0, bw, bh int, pw *BitWriter) 
 	for yy := 0; yy < bh; yy++ {
 		for xx := 0; xx < bw; xx++ {
 			idx := (y0+yy)*stride + (x0 + xx)
-			if idx < 0 || idx >= len(plane) {
+			if idx >= len(plane) {
 				return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
 			}
 			v := int32(plane[idx])
@@ -676,7 +707,7 @@ func drawBlockPlane(plane []uint8, stride int, x0, y0, bw, bh int, br *BitReader
 				val = fg
 			}
 			idx := (y0+yy)*stride + (x0 + xx)
-			if idx < 0 || idx >= len(plane) {
+			if idx >= len(plane) {
 				return fmt.Errorf("drawBlockPlane: index out of range")
 			}
 			plane[idx] = val
@@ -690,7 +721,7 @@ func fillBlockPlane(plane []uint8, stride int, x0, y0, bw, bh int, val uint8) er
 	for yy := 0; yy < bh; yy++ {
 		for xx := 0; xx < bw; xx++ {
 			idx := (y0+yy)*stride + (x0 + xx)
-			if idx < 0 || idx >= len(plane) {
+			if idx >= len(plane) {
 				return fmt.Errorf("fillBlockPlane: index out of range")
 			}
 			plane[idx] = val
