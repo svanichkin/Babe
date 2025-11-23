@@ -875,100 +875,92 @@ func fillBlockPlane(plane []uint8, stride int, x0, y0, bw, bh int, val uint8) er
 	return nil
 }
 
-// readChannelSegment reads a single channel stream (as written by Encode)
-// from the shared reader into a standalone byte slice. The layout of this
-// slice matches what decodeChannel expects, so decodeChannel can run on
-// an independent reader in parallel for each channel.
-func readChannelSegment(br *bufio.Reader) ([]byte, error) {
-	var buf bytes.Buffer
-	var tmp4 [4]byte
+// readChannelSegment returns a zero-copy slice of the next channel stream
+// (as written by Encode) from the decompressed payload. It advances *pos
+// to the byte immediately after this segment.
+func readChannelSegment(data []byte, pos *int) ([]byte, error) {
+	start := *pos
 
-	// Helper to read a uint32, write its raw bytes into buf, and return the value.
-	readU32 := func() (uint32, error) {
-		if _, err := io.ReadFull(br, tmp4[:]); err != nil {
-			return 0, err
+	readU32 := func(label string) (uint32, error) {
+		if len(data)-*pos < 4 {
+			return 0, fmt.Errorf("readChannelSegment: truncated while reading %s", label)
 		}
-		if _, err := buf.Write(tmp4[:]); err != nil {
-			return 0, err
-		}
-		return binary.BigEndian.Uint32(tmp4[:]), nil
+		v := binary.BigEndian.Uint32(data[*pos : *pos+4])
+		*pos += 4
+		return v, nil
 	}
 
-	// Helper to copy n bytes from br directly into buf without intermediate allocations.
-	readCopyN := func(n uint32) error {
-		if n == 0 {
-			return nil
-		}
-		if _, err := io.CopyN(&buf, br, int64(n)); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	// blockCount (4 bytes)
-	if _, err := readU32(); err != nil {
+	// blockCount (4 bytes) – we don't need the value here, just skip it.
+	if _, err := readU32("blockCount"); err != nil {
 		return nil, err
 	}
+
 	// sizeStreamLen (4 bytes) + payload
-	sizeStreamLen, err := readU32()
+	sizeStreamLen, err := readU32("sizeStreamLen")
 	if err != nil {
 		return nil, err
 	}
-	if err := readCopyN(sizeStreamLen); err != nil {
-		return nil, err
+	if uint32(len(data)-*pos) < sizeStreamLen {
+		return nil, fmt.Errorf("readChannelSegment: truncated size stream")
 	}
+	*pos += int(sizeStreamLen)
+
 	// typeStreamLen (4 bytes) + payload
-	typeStreamLen, err := readU32()
+	typeStreamLen, err := readU32("typeStreamLen")
 	if err != nil {
 		return nil, err
 	}
-	if err := readCopyN(typeStreamLen); err != nil {
-		return nil, err
+	if uint32(len(data)-*pos) < typeStreamLen {
+		return nil, fmt.Errorf("readChannelSegment: truncated type stream")
 	}
+	*pos += int(typeStreamLen)
+
 	// patternLen (4 bytes) + payload
-	patternLen, err := readU32()
+	patternLen, err := readU32("patternLen")
 	if err != nil {
 		return nil, err
 	}
-	if err := readCopyN(patternLen); err != nil {
-		return nil, err
+	if uint32(len(data)-*pos) < patternLen {
+		return nil, fmt.Errorf("readChannelSegment: truncated pattern stream")
 	}
+	*pos += int(patternLen)
 
 	// FG: mode (1 byte)
-	b, err := br.ReadByte()
-	if err != nil {
-		return nil, err
+	if len(data)-*pos < 1 {
+		return nil, fmt.Errorf("readChannelSegment: truncated FG mode")
 	}
-	if err := buf.WriteByte(b); err != nil {
-		return nil, err
-	}
+	*pos++
 	// FG packed length (4 bytes) + payload
-	fgPackedLen, err := readU32()
+	fgPackedLen, err := readU32("FG packedLen")
 	if err != nil {
 		return nil, err
 	}
-	if err := readCopyN(fgPackedLen); err != nil {
-		return nil, err
+	if uint32(len(data)-*pos) < fgPackedLen {
+		return nil, fmt.Errorf("readChannelSegment: truncated FG packed data")
 	}
+	*pos += int(fgPackedLen)
 
 	// BG: mode (1 byte)
-	b, err = br.ReadByte()
-	if err != nil {
-		return nil, err
+	if len(data)-*pos < 1 {
+		return nil, fmt.Errorf("readChannelSegment: truncated BG mode")
 	}
-	if err := buf.WriteByte(b); err != nil {
-		return nil, err
-	}
+	*pos++
 	// BG packed length (4 bytes) + payload
-	bgPackedLen, err := readU32()
+	bgPackedLen, err := readU32("BG packedLen")
 	if err != nil {
 		return nil, err
 	}
-	if err := readCopyN(bgPackedLen); err != nil {
-		return nil, err
+	if uint32(len(data)-*pos) < bgPackedLen {
+		return nil, fmt.Errorf("readChannelSegment: truncated BG packed data")
+	}
+	*pos += int(bgPackedLen)
+
+	end := *pos
+	if end < start || end > len(data) {
+		return nil, fmt.Errorf("readChannelSegment: invalid segment bounds")
 	}
 
-	return buf.Bytes(), nil
+	return data[start:end], nil
 }
 
 // decodeChannel decodes one channel stream into a planar buffer of size imgW x imgH.
@@ -1034,86 +1026,52 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 	}
 	patternBR := NewBitReader(patternBytes)
 
-	// FG: read mode and decode accordingly
+	// FG: read mode and decode as a delta stream
 	if pos >= len(data) {
 		return nil, fmt.Errorf("decodeChannel: truncated while reading FG mode")
 	}
 	modeFG := data[pos]
+	_ = modeFG // currently both modes share the same delta scheme
 	pos++
 
-	var fgVals []uint8
-	var fgCount32 uint32
-	if modeFG == 0 {
-		packedLen, err := readU32("FG packedLen")
-		if err != nil {
-			return nil, err
-		}
-		packed, err := readSlice(packedLen, "FG packed data")
-		if err != nil {
-			return nil, err
-		}
-		fgVals, err = deltaUnpackBytes(packed, int(packedLen))
-		if err != nil {
-			return nil, err
-		}
-		fgCount32 = uint32(len(fgVals))
-	} else {
-		packedLen, err := readU32("FG packedLen (mode 1)")
-		if err != nil {
-			return nil, err
-		}
-		packed, err := readSlice(packedLen, "FG packed data (mode 1)")
-		if err != nil {
-			return nil, err
-		}
-		fgVals, err = deltaUnpackBytes(packed, int(packedLen))
-		if err != nil {
-			return nil, err
-		}
-		fgCount32 = uint32(len(fgVals))
+	fgPackedLen, err := readU32("FG packedLen")
+	if err != nil {
+		return nil, err
+	}
+	fgPacked, err := readSlice(fgPackedLen, "FG packed data")
+	if err != nil {
+		return nil, err
+	}
+	if blockCount > 0 && fgPackedLen < blockCount {
+		return nil, fmt.Errorf("decodeChannel: FG packed data too short")
+	}
+	fgStream, err := newDeltaStream(fgPacked, int(blockCount))
+	if err != nil {
+		return nil, err
 	}
 
-	// BG: read mode and decode accordingly
+	// BG: read mode and decode as a delta stream
 	if pos >= len(data) {
 		return nil, fmt.Errorf("decodeChannel: truncated while reading BG mode")
 	}
 	modeBG := data[pos]
+	_ = modeBG // currently both modes share the same delta scheme
 	pos++
 
-	var bgVals []uint8
-	var bgCount32 uint32
-	if modeBG == 0 {
-		packedLen, err := readU32("BG packedLen")
-		if err != nil {
-			return nil, err
-		}
-		packed, err := readSlice(packedLen, "BG packed data")
-		if err != nil {
-			return nil, err
-		}
-		bgVals, err = deltaUnpackBytes(packed, int(packedLen))
-		if err != nil {
-			return nil, err
-		}
-		bgCount32 = uint32(len(bgVals))
-	} else {
-		packedLen, err := readU32("BG packedLen (mode 1)")
-		if err != nil {
-			return nil, err
-		}
-		packed, err := readSlice(packedLen, "BG packed data (mode 1)")
-		if err != nil {
-			return nil, err
-		}
-		bgVals, err = deltaUnpackBytes(packed, int(packedLen))
-		if err != nil {
-			return nil, err
-		}
-		bgCount32 = uint32(len(bgVals))
+	bgPackedLen, err := readU32("BG packedLen")
+	if err != nil {
+		return nil, err
 	}
-
-	if fgCount32 != blockCount || bgCount32 != blockCount {
-		return nil, fmt.Errorf("color count mismatch: fg=%d bg=%d blocks=%d", fgCount32, bgCount32, blockCount)
+	bgPacked, err := readSlice(bgPackedLen, "BG packed data")
+	if err != nil {
+		return nil, err
+	}
+	if blockCount > 0 && bgPackedLen < blockCount {
+		return nil, fmt.Errorf("decodeChannel: BG packed data too short")
+	}
+	bgStream, err := newDeltaStream(bgPacked, int(blockCount))
+	if err != nil {
+		return nil, err
 	}
 
 	// reconstruct the block geometry and fill the plane
@@ -1138,8 +1096,6 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 
 	blockIndex := 0
 	macroIndex := 0
-	fgIndex := 0
-	bgIndex := 0
 
 	// main macroBlock x macroBlock area
 	for my := 0; my < fullH; my += macroBlock {
@@ -1148,16 +1104,21 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 				return nil, fmt.Errorf("unexpected end of blocks in main area")
 			}
 			if useMacro && macroBig[macroIndex] {
-				// macroBlock: read one type bit, FG and BG from arrays, use full pattern
+				// macroBlock: read one type bit, FG and BG from the delta streams, use full pattern
 				bitType, err := typeBR.ReadBit()
 				if err != nil {
 					return nil, err
 				}
 				_ = bitType // always true for macro blocks
-				fg := fgVals[fgIndex]
-				bg := bgVals[bgIndex]
-				fgIndex++
-				bgIndex++
+
+				fg, err := fgStream.Next()
+				if err != nil {
+					return nil, err
+				}
+				bg, err := bgStream.Next()
+				if err != nil {
+					return nil, err
+				}
 				if err := drawBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, patternBR, fg, bg); err != nil {
 					return nil, err
 				}
@@ -1173,10 +1134,14 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 						if err != nil {
 							return nil, err
 						}
-						fg := fgVals[fgIndex]
-						bg := bgVals[bgIndex]
-						fgIndex++
-						bgIndex++
+						fg, err := fgStream.Next()
+						if err != nil {
+							return nil, err
+						}
+						bg, err := bgStream.Next()
+						if err != nil {
+							return nil, err
+						}
 						if bitType {
 							if err := drawBlockPlane(plane, imgW, mx+bx, my+by, smallBlock, smallBlock, patternBR, fg, bg); err != nil {
 								return nil, err
@@ -1204,10 +1169,14 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 			if err != nil {
 				return nil, err
 			}
-			fg := fgVals[fgIndex]
-			bg := bgVals[bgIndex]
-			fgIndex++
-			bgIndex++
+			fg, err := fgStream.Next()
+			if err != nil {
+				return nil, err
+			}
+			bg, err := bgStream.Next()
+			if err != nil {
+				return nil, err
+			}
 			if bitType {
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, patternBR, fg, bg); err != nil {
 					return nil, err
@@ -1230,10 +1199,14 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 			if err != nil {
 				return nil, err
 			}
-			fg := fgVals[fgIndex]
-			bg := bgVals[bgIndex]
-			fgIndex++
-			bgIndex++
+			fg, err := fgStream.Next()
+			if err != nil {
+				return nil, err
+			}
+			bg, err := bgStream.Next()
+			if err != nil {
+				return nil, err
+			}
 			if bitType {
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, patternBR, fg, bg); err != nil {
 					return nil, err
@@ -1246,11 +1219,15 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 			blockIndex++
 		}
 	}
-	if fgIndex != int(blockCount) || bgIndex != int(blockCount) {
-		return nil, fmt.Errorf("color stream mismatch: used fg=%d bg=%d blocks=%d", fgIndex, bgIndex, blockCount)
-	}
+
 	if blockIndex != int(blockCount) {
 		return nil, fmt.Errorf("block count mismatch: used %d of %d", blockIndex, blockCount)
+	}
+	if fgStream != nil && fgStream.n != int(blockCount) && fgStream.i != int(blockCount) {
+		return nil, fmt.Errorf("color stream mismatch: used fg=%d blocks=%d", fgStream.i, blockCount)
+	}
+	if bgStream != nil && bgStream.n != int(blockCount) && bgStream.i != int(blockCount) {
+		return nil, fmt.Errorf("color stream mismatch: used bg=%d blocks=%d", bgStream.i, blockCount)
 	}
 
 	return plane, nil
@@ -1264,24 +1241,40 @@ func Decode(compData []byte) (image.Image, error) {
 		return nil, fmt.Errorf("zstd decode: %w", err)
 	}
 
-	br := bufio.NewReader(bytes.NewReader(payload))
+	if len(payload) < len(codec) {
+		return nil, fmt.Errorf("read header: short magic")
+	}
+	pos := 0
 
 	// magic
-	header := make([]byte, len(codec))
-	if _, err := io.ReadFull(br, header); err != nil {
-		return nil, fmt.Errorf("read header: %w", err)
+	if string(payload[pos:pos+len(codec)]) != codec {
+		return nil, fmt.Errorf("bad magic: %q", string(payload[pos:pos+len(codec)]))
 	}
-	if string(header) != codec {
-		return nil, fmt.Errorf("bad magic: %q", string(header))
+	pos += len(codec)
+
+	readU16 := func(label string) (uint16, error) {
+		if len(payload)-pos < 2 {
+			return 0, fmt.Errorf("decode: truncated while reading %s", label)
+		}
+		v := binary.BigEndian.Uint16(payload[pos : pos+2])
+		pos += 2
+		return v, nil
+	}
+	readU32 := func(label string) (uint32, error) {
+		if len(payload)-pos < 4 {
+			return 0, fmt.Errorf("decode: truncated while reading %s", label)
+		}
+		v := binary.BigEndian.Uint32(payload[pos : pos+4])
+		pos += 4
+		return v, nil
 	}
 
-	var bwSize, bhSize uint16
-	var imgW32, imgH32 uint32
-
-	if err := binary.Read(br, binary.BigEndian, &bwSize); err != nil {
+	bwSize, err := readU16("block width")
+	if err != nil {
 		return nil, err
 	}
-	if err := binary.Read(br, binary.BigEndian, &bhSize); err != nil {
+	bhSize, err := readU16("block height")
+	if err != nil {
 		return nil, err
 	}
 	if bwSize == 0 || bhSize == 0 {
@@ -1290,10 +1283,12 @@ func Decode(compData []byte) (image.Image, error) {
 	smallBlock = int(bwSize)
 	macroBlock = int(bhSize)
 
-	if err := binary.Read(br, binary.BigEndian, &imgW32); err != nil {
+	imgW32, err := readU32("image width")
+	if err != nil {
 		return nil, err
 	}
-	if err := binary.Read(br, binary.BigEndian, &imgH32); err != nil {
+	imgH32, err := readU32("image height")
+	if err != nil {
 		return nil, err
 	}
 	imgW := int(imgW32)
@@ -1304,17 +1299,17 @@ func Decode(compData []byte) (image.Image, error) {
 			macroBlock, smallBlock)
 	}
 
-	// read three channel segments (Y, Cb, Cr) sequentially,
+	// read three channel segments (Y, Cb, Cr) sequentially from the payload slice,
 	// then decode each one in its own goroutine.
-	ySeg, err := readChannelSegment(br)
+	ySeg, err := readChannelSegment(payload, &pos)
 	if err != nil {
 		return nil, err
 	}
-	cbSeg, err := readChannelSegment(br)
+	cbSeg, err := readChannelSegment(payload, &pos)
 	if err != nil {
 		return nil, err
 	}
-	crSeg, err := readChannelSegment(br)
+	crSeg, err := readChannelSegment(payload, &pos)
 	if err != nil {
 		return nil, err
 	}
@@ -1982,4 +1977,46 @@ func deltaUnpackBytes(packed []byte, totalLen int) ([]byte, error) {
 	}
 
 	return dst, nil
+}
+
+// deltaStream provides on-the-fly decoding of a delta-packed byte slice
+// produced by deltaPackBytes, without allocating a separate output buffer.
+type deltaStream struct {
+	packed []byte
+	n      int // total number of decoded values expected
+	i      int // number of values already returned
+	prev   byte
+}
+
+func newDeltaStream(packed []byte, n int) (*deltaStream, error) {
+	if n == 0 {
+		return &deltaStream{}, nil
+	}
+	if len(packed) < n {
+		return nil, fmt.Errorf("delta stream truncated: have %d, need %d", len(packed), n)
+	}
+	return &deltaStream{
+		packed: packed,
+		n:      n,
+		i:      0,
+		prev:   packed[0],
+	}, nil
+}
+
+func (ds *deltaStream) Next() (byte, error) {
+	if ds.n == 0 {
+		return 0, io.EOF
+	}
+	if ds.i >= ds.n {
+		return 0, io.EOF
+	}
+	if ds.i == 0 {
+		ds.i = 1
+		return ds.prev, nil
+	}
+	d := int8(ds.packed[ds.i])
+	v := decodeDelta8(ds.prev, d)
+	ds.prev = v
+	ds.i++
+	return v, nil
 }
