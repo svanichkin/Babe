@@ -825,57 +825,85 @@ func readChannelSegment(br *bufio.Reader) ([]byte, error) {
 }
 
 // decodeChannel decodes one channel stream into a planar buffer of size imgW x imgH.
-func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
-	var blockCount uint32
-	if err := binary.Read(br, binary.BigEndian, &blockCount); err != nil {
+func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
+	pos := 0
+
+	// helpers to read from the raw byte slice without extra allocations
+	readU32 := func(label string) (uint32, error) {
+		if len(data)-pos < 4 {
+			return 0, fmt.Errorf("decodeChannel: truncated while reading %s", label)
+		}
+		v := binary.BigEndian.Uint32(data[pos : pos+4])
+		pos += 4
+		return v, nil
+	}
+
+	readSlice := func(n uint32, label string) ([]byte, error) {
+		if n > uint32(len(data)-pos) {
+			return nil, fmt.Errorf("decodeChannel: truncated while reading %s", label)
+		}
+		end := pos + int(n)
+		s := data[pos:end]
+		pos = end
+		return s, nil
+	}
+
+	// blockCount
+	blockCount, err := readU32("blockCount")
+	if err != nil {
 		return nil, err
 	}
 
-	var sizeStreamLen uint32
-	if err := binary.Read(br, binary.BigEndian, &sizeStreamLen); err != nil {
+	// size stream (bit flags for macro vs small in the main area)
+	sizeStreamLen, err := readU32("sizeStreamLen")
+	if err != nil {
 		return nil, err
 	}
-	sizeBytes := make([]byte, sizeStreamLen)
-	if _, err := io.ReadFull(br, sizeBytes); err != nil {
+	sizeBytes, err := readSlice(sizeStreamLen, "sizeStream")
+	if err != nil {
 		return nil, err
 	}
 	sizeBR := NewBitReader(sizeBytes)
 
-	var typeStreamLen uint32
-	if err := binary.Read(br, binary.BigEndian, &typeStreamLen); err != nil {
+	// type stream (pattern vs solid blocks)
+	typeStreamLen, err := readU32("typeStreamLen")
+	if err != nil {
 		return nil, err
 	}
-	typeBytes := make([]byte, typeStreamLen)
-	if _, err := io.ReadFull(br, typeBytes); err != nil {
+	typeBytes, err := readSlice(typeStreamLen, "typeStream")
+	if err != nil {
 		return nil, err
 	}
 	typeBR := NewBitReader(typeBytes)
 
-	var patternLen uint32
-	if err := binary.Read(br, binary.BigEndian, &patternLen); err != nil {
+	// pattern stream (actual bi-level patterns)
+	patternLen, err := readU32("patternLen")
+	if err != nil {
 		return nil, err
 	}
-	patternBytes := make([]byte, patternLen)
-	if _, err := io.ReadFull(br, patternBytes); err != nil {
+	patternBytes, err := readSlice(patternLen, "patternStream")
+	if err != nil {
 		return nil, err
 	}
 	patternBR := NewBitReader(patternBytes)
 
 	// FG: read mode and decode accordingly
-	modeFG, err := br.ReadByte()
-	if err != nil {
-		return nil, err
+	if pos >= len(data) {
+		return nil, fmt.Errorf("decodeChannel: truncated while reading FG mode")
 	}
+	modeFG := data[pos]
+	pos++
+
 	var fgVals []uint8
 	var fgCount32 uint32
 	if modeFG == 0 {
 		// delta-coded via DeltaPackBytes/DeltaUnpackBytes
-		var packedLen uint32
-		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+		packedLen, err := readU32("FG packedLen")
+		if err != nil {
 			return nil, err
 		}
-		packed := make([]byte, packedLen)
-		if _, err := io.ReadFull(br, packed); err != nil {
+		packed, err := readSlice(packedLen, "FG packed data")
+		if err != nil {
 			return nil, err
 		}
 		fgVals, err = DeltaUnpackBytes(packed)
@@ -884,13 +912,13 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 		}
 		fgCount32 = uint32(len(fgVals))
 	} else {
-		// packed with PackBytes
-		var packedLen uint32
-		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+		// packed with PackBytes (currently still decoded via DeltaUnpackBytes)
+		packedLen, err := readU32("FG packedLen (mode 1)")
+		if err != nil {
 			return nil, err
 		}
-		packed := make([]byte, packedLen)
-		if _, err := io.ReadFull(br, packed); err != nil {
+		packed, err := readSlice(packedLen, "FG packed data (mode 1)")
+		if err != nil {
 			return nil, err
 		}
 		fgVals, err = DeltaUnpackBytes(packed)
@@ -901,20 +929,22 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 	}
 
 	// BG: read mode and decode accordingly
-	modeBG, err := br.ReadByte()
-	if err != nil {
-		return nil, err
+	if pos >= len(data) {
+		return nil, fmt.Errorf("decodeChannel: truncated while reading BG mode")
 	}
+	modeBG := data[pos]
+	pos++
+
 	var bgVals []uint8
 	var bgCount32 uint32
 	if modeBG == 0 {
 		// delta-coded via DeltaPackBytes/DeltaUnpackBytes
-		var packedLen uint32
-		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+		packedLen, err := readU32("BG packedLen")
+		if err != nil {
 			return nil, err
 		}
-		packed := make([]byte, packedLen)
-		if _, err := io.ReadFull(br, packed); err != nil {
+		packed, err := readSlice(packedLen, "BG packed data")
+		if err != nil {
 			return nil, err
 		}
 		bgVals, err = DeltaUnpackBytes(packed)
@@ -923,13 +953,13 @@ func decodeChannel(br *bufio.Reader, imgW, imgH int) ([]uint8, error) {
 		}
 		bgCount32 = uint32(len(bgVals))
 	} else {
-		// packed with PackBytes
-		var packedLen uint32
-		if err := binary.Read(br, binary.BigEndian, &packedLen); err != nil {
+		// packed with PackBytes (currently still decoded via DeltaUnpackBytes)
+		packedLen, err := readU32("BG packedLen (mode 1)")
+		if err != nil {
 			return nil, err
 		}
-		packed := make([]byte, packedLen)
-		if _, err := io.ReadFull(br, packed); err != nil {
+		packed, err := readSlice(packedLen, "BG packed data (mode 1)")
+		if err != nil {
 			return nil, err
 		}
 		bgVals, err = DeltaUnpackBytes(packed)
@@ -1161,18 +1191,15 @@ func Decode(compData []byte) (image.Image, error) {
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		r := bufio.NewReader(bytes.NewReader(ySeg))
-		resY.plane, resY.err = decodeChannel(r, imgW, imgH)
+		resY.plane, resY.err = decodeChannel(ySeg, imgW, imgH)
 	}()
 	go func() {
 		defer wg.Done()
-		r := bufio.NewReader(bytes.NewReader(cbSeg))
-		resCb.plane, resCb.err = decodeChannel(r, imgW, imgH)
+		resCb.plane, resCb.err = decodeChannel(cbSeg, imgW, imgH)
 	}()
 	go func() {
 		defer wg.Done()
-		r := bufio.NewReader(bytes.NewReader(crSeg))
-		resCr.plane, resCr.err = decodeChannel(r, imgW, imgH)
+		resCr.plane, resCr.err = decodeChannel(crSeg, imgW, imgH)
 	}()
 	wg.Wait()
 
