@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	codec = "BABE_v0.1.6_photo\n"
+	codec = "BABE\n"
 )
 
 // Default block sizes; these are overridden by compression presets via setBlocksForQuality.
