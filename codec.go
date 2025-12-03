@@ -1499,9 +1499,9 @@ func Decode(compData []byte) (image.Image, error) {
 	wgRGB.Wait()
 
 	// Post-process: gradient smoothing at junctions + light deblocking.
-	smoothed := smoothBlocks(dst)
+	// smoothed := smoothBlocks(dst)
 
-	return smoothed, nil
+	return dst, nil
 }
 
 // smoothJunctions performs gradient-based smoothing at intersections of small blocks.
