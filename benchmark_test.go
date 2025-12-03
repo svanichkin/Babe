@@ -88,7 +88,7 @@ func BenchmarkBABE(b *testing.B) {
 
 		// Decode
 		startDec := time.Now()
-		_, err = Decode(enc)
+		_, err = Decode(enc, false)
 		if err != nil {
 			b.Fatalf("decode failed: %v", err)
 		}

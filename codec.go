@@ -1266,7 +1266,7 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 
 // Decode reads a BABE-compressed stream (Zstd + three independent Y/Cb/Cr streams)
 // and returns an image.Image.
-func Decode(compData []byte) (image.Image, error) {
+func Decode(compData []byte, postfilter bool) (image.Image, error) {
 	payload, err := decompressZstd(compData)
 	if err != nil {
 		return nil, fmt.Errorf("zstd decode: %w", err)
@@ -1498,8 +1498,12 @@ func Decode(compData []byte) (image.Image, error) {
 	}
 	wgRGB.Wait()
 
-	// Post-process: gradient smoothing at junctions + light deblocking.
-	// smoothed := smoothBlocks(dst)
+	if postfilter {
+		// Post-process: gradient smoothing at junctions + light deblocking.
+		smoothed := smoothBlocks(dst)
+
+		return smoothed, nil
+	}
 
 	return dst, nil
 }

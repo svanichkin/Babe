@@ -17,7 +17,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 4 {
-		fmt.Fprint(os.Stderr, "Usage:\n  babe <input-image> [quality] [bw]\n  babe <input.babe>\n  (bw flag can appear anywhere after the filename)\n")
+		fmt.Fprint(os.Stderr, "Usage:\n  babe <input-image> [quality] [bw]\n  babe <input.babe> [-postfilter]\n  (bw flag can appear anywhere after the filename)\n")
 		os.Exit(1)
 	}
 
@@ -27,7 +27,14 @@ func main() {
 
 	// If input is .babe → decode to PNG
 	if ext == ".babe" {
-		if err := decodeBabe(inputPath, base+".png", false); err != nil {
+		postfilter := false
+		for _, a := range os.Args[2:] {
+			if a == "-postfilter" {
+				postfilter = true
+				break
+			}
+		}
+		if err := decodeBabe(inputPath, base+".png", false, postfilter); err != nil {
 			fmt.Fprintln(os.Stderr, "decode error:", err)
 			os.Exit(1)
 		}
@@ -124,7 +131,7 @@ func encodeToBabe(inPath, outPath string, quality int, bwmode bool) error {
 	return nil
 }
 
-func decodeBabe(inPath, outPath string, splitChannels bool) error {
+func decodeBabe(inPath, outPath string, splitChannels, postfilter bool) error {
 
 	in, err := os.Open(inPath)
 	if err != nil {
@@ -140,7 +147,7 @@ func decodeBabe(inPath, outPath string, splitChannels bool) error {
 	compSize := len(compData)
 
 	start := time.Now()
-	dec, err := Decode(compData)
+	dec, err := Decode(compData, postfilter)
 	if err != nil {
 		return err
 	}
