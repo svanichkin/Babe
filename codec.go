@@ -31,7 +31,7 @@ var (
 )
 
 // current encode quality in [0..100]; used to drive macro/small decisions.
-var encQuality int = 100
+var encQuality int = 70
 
 // channel presence flags for the header; at least Y must be set.
 const (

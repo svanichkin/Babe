@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/gif"
 	_ "image/jpeg"
 	"image/png"
@@ -26,7 +27,7 @@ func main() {
 
 	// If input is .babe → decode to PNG
 	if ext == ".babe" {
-		if err := decodeBabe(inputPath, base+".png"); err != nil {
+		if err := decodeBabe(inputPath, base+".png", false); err != nil {
 			fmt.Fprintln(os.Stderr, "decode error:", err)
 			os.Exit(1)
 		}
@@ -123,7 +124,7 @@ func encodeToBabe(inPath, outPath string, quality int, bwmode bool) error {
 	return nil
 }
 
-func decodeBabe(inPath, outPath string) error {
+func decodeBabe(inPath, outPath string, splitChannels bool) error {
 
 	in, err := os.Open(inPath)
 	if err != nil {
@@ -145,23 +146,6 @@ func decodeBabe(inPath, outPath string) error {
 	}
 	finish := time.Since(start)
 
-	out, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if err := png.Encode(out, dec); err != nil {
-		return err
-	}
-
-	info, err := out.Stat()
-	if err != nil {
-		return err
-	}
-	outSize := info.Size()
-	ratio := float64(outSize) / float64(compSize)
-
 	formatSize := func(size int64) string {
 		if size < 1024*1024 {
 			return fmt.Sprintf("%.2f KB", float64(size)/1024)
@@ -169,11 +153,113 @@ func decodeBabe(inPath, outPath string) error {
 		return fmt.Sprintf("%.2f MB", float64(size)/(1024*1024))
 	}
 
-	fmt.Printf("%s (%s) → %s (%s)\n",
+	if !splitChannels {
+		out, err := os.Create(outPath)
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+
+		if err := png.Encode(out, dec); err != nil {
+			return err
+		}
+
+		info, err := out.Stat()
+		if err != nil {
+			return err
+		}
+		outSize := info.Size()
+		ratio := float64(outSize) / float64(compSize)
+
+		fmt.Printf("%s (%s) → %s (%s)\n",
+			inPath,
+			formatSize(int64(compSize)),
+			outPath,
+			formatSize(outSize),
+		)
+		fmt.Printf("ratio=%.3f, time=%s\n",
+			ratio,
+			finish,
+		)
+
+		return nil
+	}
+
+	base := strings.TrimSuffix(outPath, filepath.Ext(outPath))
+	bounds := dec.Bounds()
+	yImg := image.NewGray(bounds)
+	cbImg := image.NewGray(bounds)
+	crImg := image.NewGray(bounds)
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			c := dec.At(x, y)
+			yc := color.YCbCrModel.Convert(c).(color.YCbCr)
+			yImg.SetGray(x, y, color.Gray{Y: yc.Y})
+			cbImg.SetGray(x, y, color.Gray{Y: yc.Cb})
+			crImg.SetGray(x, y, color.Gray{Y: yc.Cr})
+		}
+	}
+
+	yFile, err := os.Create(base + "_Y.png")
+	if err != nil {
+		return err
+	}
+	if err := png.Encode(yFile, yImg); err != nil {
+		yFile.Close()
+		return err
+	}
+	yFile.Close()
+
+	cbFile, err := os.Create(base + "_Cb.png")
+	if err != nil {
+		return err
+	}
+	if err := png.Encode(cbFile, cbImg); err != nil {
+		cbFile.Close()
+		return err
+	}
+	cbFile.Close()
+
+	crFile, err := os.Create(base + "_Cr.png")
+	if err != nil {
+		return err
+	}
+	if err := png.Encode(crFile, crImg); err != nil {
+		crFile.Close()
+		return err
+	}
+	crFile.Close()
+
+	var totalOutSize int64
+
+	info, err := os.Stat(base + "_Y.png")
+	if err != nil {
+		return err
+	}
+	totalOutSize += info.Size()
+
+	info, err = os.Stat(base + "_Cb.png")
+	if err != nil {
+		return err
+	}
+	totalOutSize += info.Size()
+
+	info, err = os.Stat(base + "_Cr.png")
+	if err != nil {
+		return err
+	}
+	totalOutSize += info.Size()
+
+	ratio := float64(totalOutSize) / float64(compSize)
+
+	fmt.Printf("%s (%s) → %s_Y.png,%s_Cb.png,%s_Cr.png (total %s)\n",
 		inPath,
 		formatSize(int64(compSize)),
-		outPath,
-		formatSize(outSize),
+		base,
+		base,
+		base,
+		formatSize(totalOutSize),
 	)
 	fmt.Printf("ratio=%.3f, time=%s\n",
 		ratio,
