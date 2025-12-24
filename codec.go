@@ -787,35 +787,33 @@ func canUseBigBlockChannel(plane []uint8, stride, height, x0, y0 int, spread int
 }
 
 // encodeBlockPlane encodes a single block for one planar channel:
-// it computes a mean-based threshold, writes the FG/BG pattern bits (if pw != nil),
-// and computes FG/BG levels.
-func encodeBlockPlane(plane []uint8, stride, height, x0, y0, bw, bh int, pw *bitWriter) (uint8, uint8, error) {
+// - computes a mean-based threshold
+// - computes FG/BG levels
+// - returns whether a bi-level pattern is actually needed (FG != BG)
+// - writes pattern bits to pw only when needed
+func encodeBlockPlane(plane []uint8, stride, height, x0, y0, bw, bh int, pw *bitWriter) (uint8, uint8, bool, error) {
 	total := bw * bh
 	if total <= 0 {
-		return 0, 0, fmt.Errorf("invalid block size")
+		return 0, 0, false, fmt.Errorf("invalid block size")
 	}
 
 	if bw == 1 && bh == 1 {
 		if x0 < 0 || y0 < 0 || x0 >= stride {
-			return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
+			return 0, 0, false, fmt.Errorf("encodeBlockPlane: index out of range")
 		}
 		idx := y0*stride + x0
 		if idx < 0 || idx >= len(plane) {
-			return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
+			return 0, 0, false, fmt.Errorf("encodeBlockPlane: index out of range")
 		}
 		v := plane[idx]
-		if pw != nil {
-			// thr == v, so v >= thr is always true.
-			pw.writeBit(true)
-		}
-		return v, v, nil
+		return v, v, false, nil
 	}
 
 	if x0 < 0 || y0 < 0 || bw <= 0 || bh <= 0 || stride <= 0 || height <= 0 || x0+bw > stride {
-		return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
+		return 0, 0, false, fmt.Errorf("encodeBlockPlane: index out of range")
 	}
 	if y0+bh > height {
-		return 0, 0, fmt.Errorf("encodeBlockPlane: index out of range")
+		return 0, 0, false, fmt.Errorf("encodeBlockPlane: index out of range")
 	}
 
 	if bw == 2 && bh == 2 {
@@ -879,22 +877,24 @@ func encodeBlockPlane(plane []uint8, stride, height, x0, y0, bw, bh int, pw *bit
 			bgCnt++
 		}
 
-		if pw != nil {
-			pw.writeBits(bits, 4)
-		}
-
 		if fgCnt == 0 || bgCnt == 0 {
-			return avg, avg, nil
+			return avg, avg, false, nil
 		}
 		fg := uint8(fgSum / uint64(fgCnt))
 		bg := uint8(bgSum / uint64(bgCnt))
-		return fg, bg, nil
+		if fg == bg {
+			return fg, bg, false, nil
+		}
+		if pw != nil {
+			pw.writeBits(bits, 4)
+		}
+		return fg, bg, true, nil
 	}
 
 	// Read the block once into a small stack buffer.
 	var valsBuf [64]uint8
 	if total > len(valsBuf) {
-		return 0, 0, fmt.Errorf("encodeBlockPlane: block too large")
+		return 0, 0, false, fmt.Errorf("encodeBlockPlane: block too large")
 	}
 	vals := valsBuf[:total]
 
@@ -914,40 +914,33 @@ func encodeBlockPlane(plane []uint8, stride, height, x0, y0, bw, bh int, pw *bit
 	var fgSum, bgSum uint64
 	var fgCnt, bgCnt uint32
 
-	if pw != nil {
-		var bits uint64
-		for _, v := range vals {
-			isFg := v >= thr
-			bits <<= 1
-			if isFg {
-				bits |= 1
-				fgSum += uint64(v)
-				fgCnt++
-			} else {
-				bgSum += uint64(v)
-				bgCnt++
-			}
-		}
-		pw.writeBits(bits, uint8(total))
-	} else {
-		for _, v := range vals {
-			if v >= thr {
-				fgSum += uint64(v)
-				fgCnt++
-			} else {
-				bgSum += uint64(v)
-				bgCnt++
-			}
+	var bits uint64
+	for _, v := range vals {
+		isFg := v >= thr
+		bits <<= 1
+		if isFg {
+			bits |= 1
+			fgSum += uint64(v)
+			fgCnt++
+		} else {
+			bgSum += uint64(v)
+			bgCnt++
 		}
 	}
 
 	avg := uint8(sum / uint64(total))
 	if fgCnt == 0 || bgCnt == 0 {
-		return avg, avg, nil
+		return avg, avg, false, nil
 	}
 	fg := uint8(fgSum / uint64(fgCnt))
 	bg := uint8(bgSum / uint64(bgCnt))
-	return fg, bg, nil
+	if fg == bg {
+		return fg, bg, false, nil
+	}
+	if pw != nil {
+		pw.writeBits(bits, uint8(total))
+	}
+	return fg, bg, true, nil
 }
 
 // encodeChannel builds one complete stream for a single planar channel:
@@ -1034,13 +1027,15 @@ func encodeChannel(plane []uint8, stride, w4, h4, fullW, fullH int, useMacro boo
 			useBig := useMacro && canUseBigBlockChannel(plane, stride, height, mx, my, spread)
 			sizeW.writeBit(useBig)
 			if useBig {
-				fg, bg, err := encodeBlockPlane(plane, stride, height, mx, my, macroBlock, macroBlock, &patternW)
+				fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, mx, my, macroBlock, macroBlock, &patternW)
 				if err != nil {
 					return 0, nil, nil, nil, nil, nil, err
 				}
 				fgVals = append(fgVals, fg)
-				bgVals = append(bgVals, bg)
-				typeW.writeBit(true) // always pattern
+				if isPattern {
+					bgVals = append(bgVals, bg)
+				}
+				typeW.writeBit(isPattern)
 				blockCount++
 			} else {
 				// grid of smallBlock x smallBlock blocks covering the macroBlock area
@@ -1049,17 +1044,17 @@ func encodeChannel(plane []uint8, stride, w4, h4, fullW, fullH int, useMacro boo
 						xx, yy := mx+bx, my+by
 						// for smallBlock > 1 we also emit pattern bits; for smallBlock == 1 we skip pattern bits
 						var pw *bitWriter
-						isPattern := false
 						if smallBlock > 1 {
 							pw = &patternW
-							isPattern = true
 						}
-						fg, bg, err := encodeBlockPlane(plane, stride, height, xx, yy, smallBlock, smallBlock, pw)
+						fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, xx, yy, smallBlock, smallBlock, pw)
 						if err != nil {
 							return 0, nil, nil, nil, nil, nil, err
 						}
 						fgVals = append(fgVals, fg)
-						bgVals = append(bgVals, bg)
+						if isPattern {
+							bgVals = append(bgVals, bg)
+						}
 						typeW.writeBit(isPattern)
 						blockCount++
 					}
@@ -1072,17 +1067,17 @@ func encodeChannel(plane []uint8, stride, w4, h4, fullW, fullH int, useMacro boo
 	for my := 0; my < fullH; my += smallBlock {
 		for mx := fullW; mx < w4; mx += smallBlock {
 			var pw *bitWriter
-			isPattern := false
 			if smallBlock > 1 {
 				pw = &patternW
-				isPattern = true
 			}
-			fg, bg, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
+			fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
 			if err != nil {
 				return 0, nil, nil, nil, nil, nil, err
 			}
 			fgVals = append(fgVals, fg)
-			bgVals = append(bgVals, bg)
+			if isPattern {
+				bgVals = append(bgVals, bg)
+			}
 			typeW.writeBit(isPattern)
 			blockCount++
 		}
@@ -1091,17 +1086,17 @@ func encodeChannel(plane []uint8, stride, w4, h4, fullW, fullH int, useMacro boo
 	for my := fullH; my < h4; my += smallBlock {
 		for mx := 0; mx < w4; mx += smallBlock {
 			var pw *bitWriter
-			isPattern := false
 			if smallBlock > 1 {
 				pw = &patternW
-				isPattern = true
 			}
-			fg, bg, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
+			fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
 			if err != nil {
 				return 0, nil, nil, nil, nil, nil, err
 			}
 			fgVals = append(fgVals, fg)
-			bgVals = append(bgVals, bg)
+			if isPattern {
+				bgVals = append(bgVals, bg)
+			}
 			typeW.writeBit(isPattern)
 			blockCount++
 		}
@@ -1365,22 +1360,24 @@ func (e *Encoder) encodeChannelReuse(plane []uint8, stride, w4, h4, fullW, fullH
 						bgCnt++
 					}
 
-					patternW.writeBits(bits, 4)
-
 					fg, bg := avg, avg
+					isPattern := false
 					if fgCnt != 0 && bgCnt != 0 {
 						fg = uint8(fgSum / uint64(fgCnt))
 						bg = uint8(bgSum / uint64(bgCnt))
+						isPattern = fg != bg
 					}
 
 					scratch.fgVals = append(scratch.fgVals, fg)
-					scratch.bgVals = append(scratch.bgVals, bg)
-					typeW.writeBit(true) // always pattern for big 2x2 block
+					if isPattern {
+						patternW.writeBits(bits, 4)
+						scratch.bgVals = append(scratch.bgVals, bg)
+					}
+					typeW.writeBit(isPattern)
 					blockCount++
 				} else {
 					// 4 solid 1x1 blocks, no pattern bits, type bits are all 0.
 					scratch.fgVals = append(scratch.fgVals, v0, v1, v2, v3)
-					scratch.bgVals = append(scratch.bgVals, v0, v1, v2, v3)
 					typeW.writeBits(0, 4)
 					blockCount += 4
 				}
@@ -1392,7 +1389,6 @@ func (e *Encoder) encodeChannelReuse(plane []uint8, stride, w4, h4, fullW, fullH
 			for mx := fullW; mx < w4; mx++ {
 				v := plane[my*stride+mx]
 				scratch.fgVals = append(scratch.fgVals, v)
-				scratch.bgVals = append(scratch.bgVals, v)
 				typeW.writeBit(false)
 				blockCount++
 			}
@@ -1404,7 +1400,6 @@ func (e *Encoder) encodeChannelReuse(plane []uint8, stride, w4, h4, fullW, fullH
 			for mx := 0; mx < w4; mx++ {
 				v := plane[row+mx]
 				scratch.fgVals = append(scratch.fgVals, v)
-				scratch.bgVals = append(scratch.bgVals, v)
 				typeW.writeBit(false)
 				blockCount++
 			}
@@ -1423,13 +1418,15 @@ func (e *Encoder) encodeChannelReuse(plane []uint8, stride, w4, h4, fullW, fullH
 			useBig := useMacro && canUseBigBlockChannel(plane, stride, height, mx, my, spread)
 			sizeW.writeBit(useBig)
 			if useBig {
-				fg, bg, err := encodeBlockPlane(plane, stride, height, mx, my, macroBlock, macroBlock, &patternW)
+				fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, mx, my, macroBlock, macroBlock, &patternW)
 				if err != nil {
 					return 0, nil, nil, nil, nil, nil, err
 				}
 				scratch.fgVals = append(scratch.fgVals, fg)
-				scratch.bgVals = append(scratch.bgVals, bg)
-				typeW.writeBit(true) // always pattern
+				if isPattern {
+					scratch.bgVals = append(scratch.bgVals, bg)
+				}
+				typeW.writeBit(isPattern)
 				blockCount++
 			} else {
 				// grid of smallBlock x smallBlock blocks covering the macroBlock area
@@ -1438,17 +1435,17 @@ func (e *Encoder) encodeChannelReuse(plane []uint8, stride, w4, h4, fullW, fullH
 						xx, yy := mx+bx, my+by
 						// for smallBlock > 1 we also emit pattern bits; for smallBlock == 1 we skip pattern bits
 						var pw *bitWriter
-						isPattern := false
 						if smallBlock > 1 {
 							pw = &patternW
-							isPattern = true
 						}
-						fg, bg, err := encodeBlockPlane(plane, stride, height, xx, yy, smallBlock, smallBlock, pw)
+						fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, xx, yy, smallBlock, smallBlock, pw)
 						if err != nil {
 							return 0, nil, nil, nil, nil, nil, err
 						}
 						scratch.fgVals = append(scratch.fgVals, fg)
-						scratch.bgVals = append(scratch.bgVals, bg)
+						if isPattern {
+							scratch.bgVals = append(scratch.bgVals, bg)
+						}
 						typeW.writeBit(isPattern)
 						blockCount++
 					}
@@ -1461,17 +1458,17 @@ func (e *Encoder) encodeChannelReuse(plane []uint8, stride, w4, h4, fullW, fullH
 	for my := 0; my < fullH; my += smallBlock {
 		for mx := fullW; mx < w4; mx += smallBlock {
 			var pw *bitWriter
-			isPattern := false
 			if smallBlock > 1 {
 				pw = &patternW
-				isPattern = true
 			}
-			fg, bg, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
+			fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
 			if err != nil {
 				return 0, nil, nil, nil, nil, nil, err
 			}
 			scratch.fgVals = append(scratch.fgVals, fg)
-			scratch.bgVals = append(scratch.bgVals, bg)
+			if isPattern {
+				scratch.bgVals = append(scratch.bgVals, bg)
+			}
 			typeW.writeBit(isPattern)
 			blockCount++
 		}
@@ -1480,17 +1477,17 @@ func (e *Encoder) encodeChannelReuse(plane []uint8, stride, w4, h4, fullW, fullH
 	for my := fullH; my < h4; my += smallBlock {
 		for mx := 0; mx < w4; mx += smallBlock {
 			var pw *bitWriter
-			isPattern := false
 			if smallBlock > 1 {
 				pw = &patternW
-				isPattern = true
 			}
-			fg, bg, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
+			fg, bg, isPattern, err := encodeBlockPlane(plane, stride, height, mx, my, smallBlock, smallBlock, pw)
 			if err != nil {
 				return 0, nil, nil, nil, nil, nil, err
 			}
 			scratch.fgVals = append(scratch.fgVals, fg)
-			scratch.bgVals = append(scratch.bgVals, bg)
+			if isPattern {
+				scratch.bgVals = append(scratch.bgVals, bg)
+			}
 			typeW.writeBit(isPattern)
 			blockCount++
 		}
@@ -1590,7 +1587,6 @@ func (e *Encoder) Encode(img image.Image, quality int, bwmode bool) ([]byte, err
 		wg.Wait()
 
 		for i := 0; i < chCount; i++ {
-			ch := channels[i]
 			res := results[i]
 			if res.err != nil {
 				return nil, res.err
@@ -1622,13 +1618,6 @@ func (e *Encoder) Encode(img image.Image, quality int, bwmode bool) ([]byte, err
 				return nil, err
 			}
 
-			fgMode := byte(0)
-			if ch.id != chY {
-				fgMode = 1
-			}
-			if err := e.bw.WriteByte(fgMode); err != nil {
-				return nil, err
-			}
 			if err := writeU32BE(e.bw, uint32(len(res.fgVals))); err != nil {
 				return nil, err
 			}
@@ -1636,13 +1625,6 @@ func (e *Encoder) Encode(img image.Image, quality int, bwmode bool) ([]byte, err
 				return nil, err
 			}
 
-			bgMode := byte(0)
-			if ch.id != chY {
-				bgMode = 1
-			}
-			if err := e.bw.WriteByte(bgMode); err != nil {
-				return nil, err
-			}
 			if err := writeU32BE(e.bw, uint32(len(res.bgVals))); err != nil {
 				return nil, err
 			}
@@ -1682,13 +1664,6 @@ func (e *Encoder) Encode(img image.Image, quality int, bwmode bool) ([]byte, err
 				return nil, err
 			}
 
-			fgMode := byte(0)
-			if ch.id != chY {
-				fgMode = 1
-			}
-			if err := e.bw.WriteByte(fgMode); err != nil {
-				return nil, err
-			}
 			if err := writeU32BE(e.bw, uint32(len(fgVals))); err != nil {
 				return nil, err
 			}
@@ -1696,13 +1671,6 @@ func (e *Encoder) Encode(img image.Image, quality int, bwmode bool) ([]byte, err
 				return nil, err
 			}
 
-			bgMode := byte(0)
-			if ch.id != chY {
-				bgMode = 1
-			}
-			if err := e.bw.WriteByte(bgMode); err != nil {
-				return nil, err
-			}
 			if err := writeU32BE(e.bw, uint32(len(bgVals))); err != nil {
 				return nil, err
 			}
@@ -1838,9 +1806,8 @@ func Encode(img image.Image, quality int, bwmode bool) ([]byte, error) {
 	wg.Wait()
 
 	// Write channels in fixed order of IDs: always Y first, then optional Cb/Cr.
-	// For experimentation: smallBlocks store only FG (BG is implicit = 0),
-	// macroBlocks store both FG and BG like before.
-	for i, ch := range channels {
+	// Solid blocks store only FG; BG is implicit == FG. Pattern blocks store both FG and BG.
+	for i := range channels {
 		res := results[i]
 		if res.err != nil {
 			return nil, res.err
@@ -1871,61 +1838,20 @@ func Encode(img image.Image, quality int, bwmode bool) ([]byte, error) {
 		if _, err := bw.Write(res.patternBytes); err != nil {
 			return nil, err
 		}
-		// write FG array:
-		// mode 0 = delta-coded via DeltaPackBytes (used for Y),
-		// mode 1 = packed with PackBytes (used for Cb/Cr).
-		chID := ch.id
-		if chID == chY {
-			// Y channel: delta scheme via DeltaPackBytes
-			if err := bw.WriteByte(0); err != nil {
-				return nil, err
-			}
-			fgLen := uint32(len(res.fgVals))
-			if err := writeU32BE(bw, fgLen); err != nil {
-				return nil, err
-			}
-			if err := writeDeltaPackedBytes(bw, res.fgVals); err != nil {
-				return nil, err
-			}
-		} else {
-			// Cb/Cr: pack with PackBytes
-			if err := bw.WriteByte(1); err != nil {
-				return nil, err
-			}
-			fgLen := uint32(len(res.fgVals))
-			if err := writeU32BE(bw, fgLen); err != nil {
-				return nil, err
-			}
-			if err := writeDeltaPackedBytes(bw, res.fgVals); err != nil {
-				return nil, err
-			}
+		fgLen := uint32(len(res.fgVals))
+		if err := writeU32BE(bw, fgLen); err != nil {
+			return nil, err
+		}
+		if err := writeDeltaPackedBytes(bw, res.fgVals); err != nil {
+			return nil, err
 		}
 
-		// write BG array:
-		if chID == chY {
-			// Y channel: delta scheme via DeltaPackBytes
-			if err := bw.WriteByte(0); err != nil {
-				return nil, err
-			}
-			bgLen := uint32(len(res.bgVals))
-			if err := writeU32BE(bw, bgLen); err != nil {
-				return nil, err
-			}
-			if err := writeDeltaPackedBytes(bw, res.bgVals); err != nil {
-				return nil, err
-			}
-		} else {
-			// Cb/Cr: pack with PackBytes
-			if err := bw.WriteByte(1); err != nil {
-				return nil, err
-			}
-			bgLen := uint32(len(res.bgVals))
-			if err := writeU32BE(bw, bgLen); err != nil {
-				return nil, err
-			}
-			if err := writeDeltaPackedBytes(bw, res.bgVals); err != nil {
-				return nil, err
-			}
+		bgLen := uint32(len(res.bgVals))
+		if err := writeU32BE(bw, bgLen); err != nil {
+			return nil, err
+		}
+		if err := writeDeltaPackedBytes(bw, res.bgVals); err != nil {
+			return nil, err
 		}
 	}
 
@@ -2147,11 +2073,6 @@ func readChannelSegment(data []byte, pos *int) ([]byte, error) {
 	}
 	*pos += int(patternLen)
 
-	// FG: mode (1 byte)
-	if len(data)-*pos < 1 {
-		return nil, fmt.Errorf("readChannelSegment: truncated FG mode")
-	}
-	*pos++
 	// FG packed length (4 bytes) + payload
 	fgPackedLen, err := readU32("FG packedLen")
 	if err != nil {
@@ -2162,11 +2083,6 @@ func readChannelSegment(data []byte, pos *int) ([]byte, error) {
 	}
 	*pos += int(fgPackedLen)
 
-	// BG: mode (1 byte)
-	if len(data)-*pos < 1 {
-		return nil, fmt.Errorf("readChannelSegment: truncated BG mode")
-	}
-	*pos++
 	// BG packed length (4 bytes) + payload
 	bgPackedLen, err := readU32("BG packedLen")
 	if err != nil {
@@ -2249,13 +2165,6 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 	patternBR := newBitReader(patternBytes)
 
 	// FG: read mode and decode as a delta stream
-	if pos >= len(data) {
-		return nil, fmt.Errorf("decodeChannel: truncated while reading FG mode")
-	}
-	modeFG := data[pos]
-	_ = modeFG // currently both modes share the same delta scheme
-	pos++
-
 	fgPackedLen, err := readU32("FG packedLen")
 	if err != nil {
 		return nil, err
@@ -2273,13 +2182,6 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 	}
 
 	// BG: read mode and decode as a delta stream
-	if pos >= len(data) {
-		return nil, fmt.Errorf("decodeChannel: truncated while reading BG mode")
-	}
-	modeBG := data[pos]
-	_ = modeBG // currently both modes share the same delta scheme
-	pos++
-
 	bgPackedLen, err := readU32("BG packedLen")
 	if err != nil {
 		return nil, err
@@ -2288,13 +2190,14 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 	if err != nil {
 		return nil, err
 	}
-	if blockCount > 0 && bgPackedLen < blockCount {
-		return nil, fmt.Errorf("decodeChannel: BG packed data too short")
+	if bgPackedLen > blockCount {
+		return nil, fmt.Errorf("decodeChannel: BG packed data too long")
 	}
-	bgStream, err := newDeltaStream(bgPacked, int(blockCount))
+	bgStream, err := newDeltaStream(bgPacked, int(bgPackedLen))
 	if err != nil {
 		return nil, err
 	}
+	bgPerPattern := true
 
 	// reconstruct the block geometry and fill the plane
 	plane := make([]uint8, imgW*imgH)
@@ -2331,18 +2234,37 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 				if err != nil {
 					return nil, err
 				}
-				_ = bitType // always true for macro blocks
 
 				fg, err := fgStream.next()
 				if err != nil {
 					return nil, err
 				}
-				bg, err := bgStream.next()
-				if err != nil {
-					return nil, err
-				}
-				if err := drawBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, &patternBR, fg, bg); err != nil {
-					return nil, err
+				if bitType {
+					bg := fg
+					if bgPerPattern {
+						bg, err = bgStream.next()
+						if err != nil {
+							return nil, err
+						}
+					} else {
+						bg, err = bgStream.next()
+						if err != nil {
+							return nil, err
+						}
+					}
+					if err := drawBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, &patternBR, fg, bg); err != nil {
+						return nil, err
+					}
+				} else {
+					if !bgPerPattern {
+						// legacy mode stores BG per block; consume to stay in sync
+						if _, err := bgStream.next(); err != nil {
+							return nil, err
+						}
+					}
+					if err := fillBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, fg); err != nil {
+						return nil, err
+					}
 				}
 				blockIndex++
 			} else {
@@ -2360,15 +2282,29 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 						if err != nil {
 							return nil, err
 						}
-						bg, err := bgStream.next()
-						if err != nil {
-							return nil, err
-						}
 						if bitType {
+							bg := fg
+							if bgPerPattern {
+								bg, err = bgStream.next()
+								if err != nil {
+									return nil, err
+								}
+							} else {
+								bg, err = bgStream.next()
+								if err != nil {
+									return nil, err
+								}
+							}
 							if err := drawBlockPlane(plane, imgW, mx+bx, my+by, smallBlock, smallBlock, &patternBR, fg, bg); err != nil {
 								return nil, err
 							}
 						} else {
+							if !bgPerPattern {
+								// legacy mode stores BG per block; consume to stay in sync
+								if _, err := bgStream.next(); err != nil {
+									return nil, err
+								}
+							}
 							if err := fillBlockPlane(plane, imgW, mx+bx, my+by, smallBlock, smallBlock, fg); err != nil {
 								return nil, err
 							}
@@ -2395,15 +2331,29 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 			if err != nil {
 				return nil, err
 			}
-			bg, err := bgStream.next()
-			if err != nil {
-				return nil, err
-			}
 			if bitType {
+				bg := fg
+				if bgPerPattern {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				}
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, &patternBR, fg, bg); err != nil {
 					return nil, err
 				}
 			} else {
+				if !bgPerPattern {
+					// legacy mode stores BG per block; consume to stay in sync
+					if _, err := bgStream.next(); err != nil {
+						return nil, err
+					}
+				}
 				if err := fillBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, fg); err != nil {
 					return nil, err
 				}
@@ -2425,15 +2375,29 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 			if err != nil {
 				return nil, err
 			}
-			bg, err := bgStream.next()
-			if err != nil {
-				return nil, err
-			}
 			if bitType {
+				bg := fg
+				if bgPerPattern {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				}
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, &patternBR, fg, bg); err != nil {
 					return nil, err
 				}
 			} else {
+				if !bgPerPattern {
+					// legacy mode stores BG per block; consume to stay in sync
+					if _, err := bgStream.next(); err != nil {
+						return nil, err
+					}
+				}
 				if err := fillBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, fg); err != nil {
 					return nil, err
 				}
@@ -2445,11 +2409,11 @@ func decodeChannel(data []byte, imgW, imgH int) ([]uint8, error) {
 	if blockIndex != int(blockCount) {
 		return nil, fmt.Errorf("block count mismatch: used %d of %d", blockIndex, blockCount)
 	}
-	if fgStream.n != int(blockCount) && fgStream.i != int(blockCount) {
-		return nil, fmt.Errorf("color stream mismatch: used fg=%d blocks=%d", fgStream.i, blockCount)
+	if fgStream.i != fgStream.n {
+		return nil, fmt.Errorf("color stream mismatch: fg used=%d expected=%d", fgStream.i, fgStream.n)
 	}
-	if bgStream.n != int(blockCount) && bgStream.i != int(blockCount) {
-		return nil, fmt.Errorf("color stream mismatch: used bg=%d blocks=%d", bgStream.i, blockCount)
+	if bgStream.i != bgStream.n {
+		return nil, fmt.Errorf("color stream mismatch: bg used=%d expected=%d", bgStream.i, bgStream.n)
 	}
 
 	return plane, nil
@@ -2540,13 +2504,7 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 	}
 	patternBR := newBitReader(patternBytes)
 
-	if pos >= len(data) {
-		return fmt.Errorf("decodeChannel: truncated while reading FG mode")
-	}
-	modeFG := data[pos]
-	_ = modeFG
-	pos++
-
+	// FG: delta-coded bytes, one value per block.
 	fgPackedLen, err := readU32("FG packedLen")
 	if err != nil {
 		return err
@@ -2563,13 +2521,8 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 		return err
 	}
 
-	if pos >= len(data) {
-		return fmt.Errorf("decodeChannel: truncated while reading BG mode")
-	}
-	modeBG := data[pos]
-	_ = modeBG
-	pos++
-
+	// BG: delta-coded bytes, one value per pattern block (type bit = 1).
+	bgPerPattern := true
 	bgPackedLen, err := readU32("BG packedLen")
 	if err != nil {
 		return err
@@ -2578,10 +2531,10 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 	if err != nil {
 		return err
 	}
-	if blockCount > 0 && bgPackedLen < blockCount {
-		return fmt.Errorf("decodeChannel: BG packed data too short")
+	if bgPackedLen > blockCount {
+		return fmt.Errorf("decodeChannel: BG packed data too long")
 	}
-	bgStream, err := newDeltaStream(bgPacked, int(blockCount))
+	bgStream, err := newDeltaStream(bgPacked, int(bgPackedLen))
 	if err != nil {
 		return err
 	}
@@ -2597,7 +2550,7 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 	// Hot path for the most common benchmark setting (quality >= 80):
 	// - macro blocks are 2x2
 	// - small blocks are 1x1 (always solid)
-	// This avoids per-1x1 block calls and reduces bitReader overhead.
+	// BG is stored only for pattern blocks (type bit = 1), otherwise BG == FG.
 	if useMacro && smallBlock == 1 && macroBlock == 2 {
 		macroGroupsX := fullW / 2
 		macroGroupsY := fullH / 2
@@ -2620,15 +2573,8 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 
 				macroIsBig := sizeBR.readBitFast()
 				if macroIsBig {
-					_ = typeBR.readBitFast() // must be 1 for macro blocks
-
+					bitType := typeBR.readBitFast()
 					fg := fgStream.nextFast()
-					bg := bgStream.nextFast()
-
-					bits, err := patternBR.readBits(4)
-					if err != nil {
-						return err
-					}
 
 					o00 := row0 + mx*4
 					o01 := o00 + 4
@@ -2638,25 +2584,42 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 						return fmt.Errorf("decodeChannel: index out of range")
 					}
 
-					if (bits & 0b1000) != 0 {
+					if bitType {
+						if bgStream.i >= bgStream.n {
+							return fmt.Errorf("decodeChannel: BG stream truncated")
+						}
+						bg := bgStream.nextFast()
+
+						bits, err := patternBR.readBits(4)
+						if err != nil {
+							return err
+						}
+
+						if (bits & 0b1000) != 0 {
+							pix[o00] = fg
+						} else {
+							pix[o00] = bg
+						}
+						if (bits & 0b0100) != 0 {
+							pix[o01] = fg
+						} else {
+							pix[o01] = bg
+						}
+						if (bits & 0b0010) != 0 {
+							pix[o10] = fg
+						} else {
+							pix[o10] = bg
+						}
+						if (bits & 0b0001) != 0 {
+							pix[o11] = fg
+						} else {
+							pix[o11] = bg
+						}
+					} else {
 						pix[o00] = fg
-					} else {
-						pix[o00] = bg
-					}
-					if (bits & 0b0100) != 0 {
 						pix[o01] = fg
-					} else {
-						pix[o01] = bg
-					}
-					if (bits & 0b0010) != 0 {
 						pix[o10] = fg
-					} else {
-						pix[o10] = bg
-					}
-					if (bits & 0b0001) != 0 {
 						pix[o11] = fg
-					} else {
-						pix[o11] = bg
 					}
 
 					blockIndex++
@@ -2666,13 +2629,9 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 				_ = typeBR.readBitsFast(4) // four 1x1 blocks; type bits are all 0
 
 				v0 := fgStream.nextFast()
-				_ = bgStream.nextFast()
 				v1 := fgStream.nextFast()
-				_ = bgStream.nextFast()
 				v2 := fgStream.nextFast()
-				_ = bgStream.nextFast()
 				v3 := fgStream.nextFast()
-				_ = bgStream.nextFast()
 
 				o00 := row0 + mx*4
 				o01 := o00 + 4
@@ -2696,7 +2655,6 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 			for mx := fullW; mx < w4; mx++ {
 				_ = typeBR.readBitFast()
 				v := fgStream.nextFast()
-				_ = bgStream.nextFast()
 
 				o := row + mx*4
 				if o < 0 || o >= len(pix) {
@@ -2713,7 +2671,6 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 			for mx := 0; mx < w4; mx++ {
 				_ = typeBR.readBitFast()
 				v := fgStream.nextFast()
-				_ = bgStream.nextFast()
 
 				o := row + mx*4
 				if o < 0 || o >= len(pix) {
@@ -2726,6 +2683,12 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 
 		if blockIndex != int(blockCount) {
 			return fmt.Errorf("block count mismatch: used %d of %d", blockIndex, blockCount)
+		}
+		if fgStream.i != fgStream.n {
+			return fmt.Errorf("color stream mismatch: fg used=%d expected=%d", fgStream.i, fgStream.n)
+		}
+		if bgStream.i != bgStream.n {
+			return fmt.Errorf("color stream mismatch: bg used=%d expected=%d", bgStream.i, bgStream.n)
 		}
 		return nil
 	}
@@ -2746,12 +2709,27 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 				if err != nil {
 					return err
 				}
-				_ = bitType
-
 				fg := fgStream.nextFast()
-				bg := bgStream.nextFast()
-				if err := drawBlockPix(pix, strideBytes, mx, my, macroBlock, macroBlock, &patternBR, fg, bg, channelOffset); err != nil {
-					return err
+				if bitType {
+					var bg uint8
+					if bgPerPattern {
+						if bgStream.i >= bgStream.n {
+							return fmt.Errorf("decodeChannel: BG stream truncated")
+						}
+						bg = bgStream.nextFast()
+					} else {
+						bg = bgStream.nextFast()
+					}
+					if err := drawBlockPix(pix, strideBytes, mx, my, macroBlock, macroBlock, &patternBR, fg, bg, channelOffset); err != nil {
+						return err
+					}
+				} else {
+					if !bgPerPattern {
+						_ = bgStream.nextFast()
+					}
+					if err := fillBlockPix(pix, strideBytes, mx, my, macroBlock, macroBlock, fg, channelOffset); err != nil {
+						return err
+					}
 				}
 				blockIndex++
 				continue
@@ -2767,12 +2745,23 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 						return err
 					}
 					fg := fgStream.nextFast()
-					bg := bgStream.nextFast()
 					if bitType {
+						var bg uint8
+						if bgPerPattern {
+							if bgStream.i >= bgStream.n {
+								return fmt.Errorf("decodeChannel: BG stream truncated")
+							}
+							bg = bgStream.nextFast()
+						} else {
+							bg = bgStream.nextFast()
+						}
 						if err := drawBlockPix(pix, strideBytes, mx+bx, my+by, smallBlock, smallBlock, &patternBR, fg, bg, channelOffset); err != nil {
 							return err
 						}
 					} else {
+						if !bgPerPattern {
+							_ = bgStream.nextFast()
+						}
 						if err := fillBlockPix(pix, strideBytes, mx+bx, my+by, smallBlock, smallBlock, fg, channelOffset); err != nil {
 							return err
 						}
@@ -2794,12 +2783,23 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 				return err
 			}
 			fg := fgStream.nextFast()
-			bg := bgStream.nextFast()
 			if bitType {
+				var bg uint8
+				if bgPerPattern {
+					if bgStream.i >= bgStream.n {
+						return fmt.Errorf("decodeChannel: BG stream truncated")
+					}
+					bg = bgStream.nextFast()
+				} else {
+					bg = bgStream.nextFast()
+				}
 				if err := drawBlockPix(pix, strideBytes, mx, my, smallBlock, smallBlock, &patternBR, fg, bg, channelOffset); err != nil {
 					return err
 				}
 			} else {
+				if !bgPerPattern {
+					_ = bgStream.nextFast()
+				}
 				if err := fillBlockPix(pix, strideBytes, mx, my, smallBlock, smallBlock, fg, channelOffset); err != nil {
 					return err
 				}
@@ -2819,12 +2819,23 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 				return err
 			}
 			fg := fgStream.nextFast()
-			bg := bgStream.nextFast()
 			if bitType {
+				var bg uint8
+				if bgPerPattern {
+					if bgStream.i >= bgStream.n {
+						return fmt.Errorf("decodeChannel: BG stream truncated")
+					}
+					bg = bgStream.nextFast()
+				} else {
+					bg = bgStream.nextFast()
+				}
 				if err := drawBlockPix(pix, strideBytes, mx, my, smallBlock, smallBlock, &patternBR, fg, bg, channelOffset); err != nil {
 					return err
 				}
 			} else {
+				if !bgPerPattern {
+					_ = bgStream.nextFast()
+				}
 				if err := fillBlockPix(pix, strideBytes, mx, my, smallBlock, smallBlock, fg, channelOffset); err != nil {
 					return err
 				}
@@ -2836,11 +2847,11 @@ func decodeChannelToPix(data []byte, imgW, imgH int, pix []byte, strideBytes int
 	if blockIndex != int(blockCount) {
 		return fmt.Errorf("block count mismatch: used %d of %d", blockIndex, blockCount)
 	}
-	if fgStream.n != int(blockCount) && fgStream.i != int(blockCount) {
-		return fmt.Errorf("color stream mismatch: used fg=%d blocks=%d", fgStream.i, blockCount)
+	if fgStream.i != fgStream.n {
+		return fmt.Errorf("color stream mismatch: fg used=%d expected=%d", fgStream.i, fgStream.n)
 	}
-	if bgStream.n != int(blockCount) && bgStream.i != int(blockCount) {
-		return fmt.Errorf("color stream mismatch: used bg=%d blocks=%d", bgStream.i, blockCount)
+	if bgStream.i != bgStream.n {
+		return fmt.Errorf("color stream mismatch: bg used=%d expected=%d", bgStream.i, bgStream.n)
 	}
 	return nil
 }
@@ -2907,14 +2918,7 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 	}
 	patternBR := newBitReader(patternBytes)
 
-	// FG: read mode and decode as a delta stream
-	if pos >= len(data) {
-		return nil, fmt.Errorf("decodeChannel: truncated while reading FG mode")
-	}
-	modeFG := data[pos]
-	_ = modeFG // currently both modes share the same delta scheme
-	pos++
-
+	// FG: delta-coded bytes, one value per block.
 	fgPackedLen, err := readU32("FG packedLen")
 	if err != nil {
 		return nil, err
@@ -2931,14 +2935,8 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 		return nil, err
 	}
 
-	// BG: read mode and decode as a delta stream
-	if pos >= len(data) {
-		return nil, fmt.Errorf("decodeChannel: truncated while reading BG mode")
-	}
-	modeBG := data[pos]
-	_ = modeBG // currently both modes share the same delta scheme
-	pos++
-
+	// BG: delta-coded bytes, one value per pattern block (type bit = 1).
+	bgPerPattern := true
 	bgPackedLen, err := readU32("BG packedLen")
 	if err != nil {
 		return nil, err
@@ -2947,10 +2945,10 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 	if err != nil {
 		return nil, err
 	}
-	if blockCount > 0 && bgPackedLen < blockCount {
-		return nil, fmt.Errorf("decodeChannel: BG packed data too short")
+	if bgPackedLen > blockCount {
+		return nil, fmt.Errorf("decodeChannel: BG packed data too long")
 	}
-	bgStream, err := newDeltaStream(bgPacked, int(blockCount))
+	bgStream, err := newDeltaStream(bgPacked, int(bgPackedLen))
 	if err != nil {
 		return nil, err
 	}
@@ -3006,18 +3004,37 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 				if err != nil {
 					return nil, err
 				}
-				_ = bitType // always true for macro blocks
 
 				fg, err := fgStream.next()
 				if err != nil {
 					return nil, err
 				}
-				bg, err := bgStream.next()
-				if err != nil {
-					return nil, err
-				}
-				if err := drawBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, &patternBR, fg, bg); err != nil {
-					return nil, err
+				if bitType {
+					bg := fg
+					if bgPerPattern {
+						bg, err = bgStream.next()
+						if err != nil {
+							return nil, err
+						}
+					} else {
+						bg, err = bgStream.next()
+						if err != nil {
+							return nil, err
+						}
+					}
+					if err := drawBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, &patternBR, fg, bg); err != nil {
+						return nil, err
+					}
+				} else {
+					if !bgPerPattern {
+						// legacy mode stores BG per block; consume to stay in sync
+						if _, err := bgStream.next(); err != nil {
+							return nil, err
+						}
+					}
+					if err := fillBlockPlane(plane, imgW, mx, my, macroBlock, macroBlock, fg); err != nil {
+						return nil, err
+					}
 				}
 				blockIndex++
 			} else {
@@ -3035,15 +3052,29 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 						if err != nil {
 							return nil, err
 						}
-						bg, err := bgStream.next()
-						if err != nil {
-							return nil, err
-						}
 						if bitType {
+							bg := fg
+							if bgPerPattern {
+								bg, err = bgStream.next()
+								if err != nil {
+									return nil, err
+								}
+							} else {
+								bg, err = bgStream.next()
+								if err != nil {
+									return nil, err
+								}
+							}
 							if err := drawBlockPlane(plane, imgW, mx+bx, my+by, smallBlock, smallBlock, &patternBR, fg, bg); err != nil {
 								return nil, err
 							}
 						} else {
+							if !bgPerPattern {
+								// legacy mode stores BG per block; consume to stay in sync
+								if _, err := bgStream.next(); err != nil {
+									return nil, err
+								}
+							}
 							if err := fillBlockPlane(plane, imgW, mx+bx, my+by, smallBlock, smallBlock, fg); err != nil {
 								return nil, err
 							}
@@ -3070,15 +3101,29 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 			if err != nil {
 				return nil, err
 			}
-			bg, err := bgStream.next()
-			if err != nil {
-				return nil, err
-			}
 			if bitType {
+				bg := fg
+				if bgPerPattern {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				}
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, &patternBR, fg, bg); err != nil {
 					return nil, err
 				}
 			} else {
+				if !bgPerPattern {
+					// legacy mode stores BG per block; consume to stay in sync
+					if _, err := bgStream.next(); err != nil {
+						return nil, err
+					}
+				}
 				if err := fillBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, fg); err != nil {
 					return nil, err
 				}
@@ -3100,15 +3145,29 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 			if err != nil {
 				return nil, err
 			}
-			bg, err := bgStream.next()
-			if err != nil {
-				return nil, err
-			}
 			if bitType {
+				bg := fg
+				if bgPerPattern {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					bg, err = bgStream.next()
+					if err != nil {
+						return nil, err
+					}
+				}
 				if err := drawBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, &patternBR, fg, bg); err != nil {
 					return nil, err
 				}
 			} else {
+				if !bgPerPattern {
+					// legacy mode stores BG per block; consume to stay in sync
+					if _, err := bgStream.next(); err != nil {
+						return nil, err
+					}
+				}
 				if err := fillBlockPlane(plane, imgW, mx, my, smallBlock, smallBlock, fg); err != nil {
 					return nil, err
 				}
@@ -3120,11 +3179,11 @@ func (d *Decoder) decodeChannelInto(data []byte, imgW, imgH int, scratch *decode
 	if blockIndex != int(blockCount) {
 		return nil, fmt.Errorf("block count mismatch: used %d of %d", blockIndex, blockCount)
 	}
-	if fgStream.n != int(blockCount) && fgStream.i != int(blockCount) {
-		return nil, fmt.Errorf("color stream mismatch: used fg=%d blocks=%d", fgStream.i, blockCount)
+	if fgStream.i != fgStream.n {
+		return nil, fmt.Errorf("color stream mismatch: fg used=%d expected=%d", fgStream.i, fgStream.n)
 	}
-	if bgStream.n != int(blockCount) && bgStream.i != int(blockCount) {
-		return nil, fmt.Errorf("color stream mismatch: used bg=%d blocks=%d", bgStream.i, blockCount)
+	if bgStream.i != bgStream.n {
+		return nil, fmt.Errorf("color stream mismatch: bg used=%d expected=%d", bgStream.i, bgStream.n)
 	}
 
 	return plane, nil
